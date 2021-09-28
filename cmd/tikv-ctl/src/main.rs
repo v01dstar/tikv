@@ -31,7 +31,7 @@ use pd_client::{Config as PdConfig, PdClient, RpcClient};
 use protobuf::Message;
 use raft::eraftpb::{ConfChange, ConfChangeV2, Entry, EntryType};
 use raft_log_engine::RaftLogEngine;
-use raftstore::store::INIT_EPOCH_CONF_VER;
+use raftstore::store::{INIT_EPOCH_VER, INIT_EPOCH_CONF_VER};
 use regex::Regex;
 use security::{SecurityConfig, SecurityManager};
 use serde_json::json;
@@ -585,7 +585,7 @@ trait DebugExecutor {
     fn drop_unapplied_raftlog(&self, region_ids: Option<Vec<u64>>);
 
     /// Recreate the region with metadata from pd, but alloc new id for it.
-    fn recreate_region(&self, sec_mgr: Arc<SecurityManager>, pd_cfg: &PdConfig, region_id: u64);
+    fn recreate_region(&self, sec_mgr: Arc<SecurityManager>, pd_cfg: &PdConfig, start: &str, end: &str);
 
     fn check_region_consistency(&self, _: u64);
 
@@ -820,7 +820,7 @@ impl DebugExecutor for DebugClient {
         unimplemented!("only available for local mode");
     }
 
-    fn recreate_region(&self, _: Arc<SecurityManager>, _: &PdConfig, _: u64) {
+    fn recreate_region(&self, _: Arc<SecurityManager>, _: &PdConfig, _: &str, _: &str) {
         unimplemented!("only available for local mode");
     }
 
@@ -1013,18 +1013,13 @@ impl<ER: RaftEngine> DebugExecutor for Debugger<ER> {
         println!("success");
     }
 
-    fn recreate_region(&self, mgr: Arc<SecurityManager>, pd_cfg: &PdConfig, region_id: u64) {
+    fn recreate_region(&self, mgr: Arc<SecurityManager>, pd_cfg: &PdConfig, start: &str, end: &str) {
         let rpc_client = RpcClient::new(pd_cfg, None, mgr)
             .unwrap_or_else(|e| perror_and_exit("RpcClient::new", e));
 
-        let mut region = match block_on(rpc_client.get_region_by_id(region_id)) {
-            Ok(Some(region)) => region,
-            Ok(None) => {
-                println!("no such region {} on PD", region_id);
-                process::exit(-1)
-            }
-            Err(e) => perror_and_exit("RpcClient::get_region_by_id", e),
-        };
+        let mut region = Region::default();
+	region.set_start_key(from_hex(start).unwrap());
+	region.set_end_key(from_hex(end).unwrap());
 
         let new_region_id = rpc_client
             .alloc_id()
@@ -1036,8 +1031,7 @@ impl<ER: RaftEngine> DebugExecutor for Debugger<ER> {
         let store_id = self.get_store_id().expect("get store id");
 
         region.set_id(new_region_id);
-        let old_version = region.get_region_epoch().get_version();
-        region.mut_region_epoch().set_version(old_version + 1);
+        region.mut_region_epoch().set_version(INIT_EPOCH_VER);
         region.mut_region_epoch().set_conf_ver(INIT_EPOCH_CONF_VER);
 
         region.peers.clear();
@@ -1502,9 +1496,13 @@ enum Cmd {
         /// PD endpoints
         pd: Vec<String>,
 
-        #[structopt(short = "r")]
-        /// The origin region id
-        region: u64,
+        #[structopt(long, default_value = "")]
+        /// hex start key
+        start: String,
+
+        #[structopt(long, default_value = "")]
+        /// hex end key
+        end: String,
     },
     /// Print the metrics
     Metrics {
@@ -2148,15 +2146,14 @@ fn main() {
             }
         }
     } else if let Cmd::RecreateRegion {
-        pd,
-        region: region_id,
+        pd, start, end
     } = cmd
     {
         let pd_cfg = PdConfig {
             endpoints: pd,
             ..Default::default()
         };
-        debug_executor.recreate_region(mgr, &pd_cfg, region_id);
+        debug_executor.recreate_region(mgr, &pd_cfg, &start, &end);
     } else if let Cmd::ConsistencyCheck { region } = cmd {
         debug_executor.check_region_consistency(region);
     } else if let Cmd::BadRegions {} = cmd {
