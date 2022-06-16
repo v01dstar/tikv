@@ -30,7 +30,9 @@ use engine_rocks::{
         DBCompressionType, DBRateLimiterMode, DBRecoveryMode, Env, LRUCacheOptions,
         PrepopulateBlockCache,
     },
-    util::{FixedPrefixSliceTransform, FixedSuffixSliceTransform, NoopSliceTransform},
+    util::{
+        ComparatorWithTs, FixedPrefixSliceTransform, FixedSuffixSliceTransform, NoopSliceTransform,
+    },
     RaftDbLogger, RangePropertiesCollectorFactory, RocksCfOptions, RocksDbOptions, RocksEngine,
     RocksEventListener, RocksTitanDbOptions, RocksdbLogger, TtlPropertiesCollectorFactory,
     DEFAULT_PROP_KEYS_INDEX_DISTANCE, DEFAULT_PROP_SIZE_INDEX_DISTANCE,
@@ -732,7 +734,7 @@ impl Default for WriteCfConfig {
             optimize_filters_for_hits: false,
             whole_key_filtering: false,
             bloom_filter_bits_per_key: 10,
-            block_based_bloom_filter: false,
+            block_based_bloom_filter: true,
             read_amp_bytes_per_bit: 0,
             compression_per_level: [
                 DBCompressionType::No,
@@ -787,12 +789,12 @@ impl WriteCfConfig {
     ) -> RocksCfOptions {
         let mut cf_opts = build_cf_opt!(self, CF_WRITE, cache, region_info_accessor);
         // Prefix extractor(trim the timestamp at tail) for write cf.
-        cf_opts
-            .set_prefix_extractor(
-                "FixedSuffixSliceTransform",
-                FixedSuffixSliceTransform::new(8),
-            )
-            .unwrap();
+        // cf_opts
+        //     .set_prefix_extractor(
+        //         "FixedSuffixSliceTransform",
+        //         FixedSuffixSliceTransform::new(8),
+        //     )
+        //     .unwrap();
         // Create prefix bloom filter for memtable.
         cf_opts.set_memtable_prefix_bloom_size_ratio(0.1);
         // Collects user defined properties.
@@ -812,6 +814,9 @@ impl WriteCfConfig {
             )
             .unwrap();
         cf_opts.set_titandb_options(&self.titan.build_opts());
+        cf_opts
+            .add_timestamp_aware_comparator("tikv.ComparatorWithTs", 8, ComparatorWithTs::new())
+            .unwrap();
         cf_opts
     }
 }

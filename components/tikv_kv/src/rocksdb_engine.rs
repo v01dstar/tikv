@@ -21,7 +21,7 @@ use kvproto::{kvrpcpb::Context, metapb, raft_cmdpb};
 use raftstore::coprocessor::CoprocessorHost;
 use tempfile::{Builder, TempDir};
 use tikv_util::worker::{Runnable, Scheduler, Worker};
-use txn_types::{Key, Value};
+use txn_types::{Key, TimeStamp, Value};
 
 use super::{
     write_modifies, Callback, DummySnapshotExt, Engine, Error, ErrorInner, ExtCallback,
@@ -281,6 +281,17 @@ impl Snapshot for Arc<RocksSnapshot> {
         Ok(v.map(|v| v.to_vec()))
     }
 
+    fn get_val_ts_cf_opt(
+        &self,
+        opts: ReadOptions,
+        cf: CfName,
+        key: &Key,
+    ) -> Result<Option<(Value, TimeStamp)>> {
+        trace!("RocksSnapshot: get_val_ts_cf_opt"; "cf" => cf, "key" => %key);
+        let v = self.get_value_ts_cf_opt(&opts, cf, key.as_encoded())?;
+        Ok(v.map(|(v, ts)| (v.to_vec(), TimeStamp::from_encoded(ts))))
+    }
+
     fn iter(&self, cf: CfName, iter_opt: IterOptions) -> Result<Self::Iter> {
         trace!("RocksSnapshot: create cf iterator");
         Ok(self.iterator_opt(cf, iter_opt)?)
@@ -322,6 +333,10 @@ impl EngineIterator for RocksEngineIterator {
 
     fn key(&self) -> &[u8] {
         Iterator::key(self)
+    }
+
+    fn timestamp(&self) -> Option<&[u8]> {
+        Iterator::timestamp(self)
     }
 
     fn value(&self) -> &[u8] {

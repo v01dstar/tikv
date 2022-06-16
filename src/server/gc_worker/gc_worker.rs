@@ -599,7 +599,7 @@ where
     }
 
     fn delete_raws(&mut self, key: Key, raw_modifies: &mut MvccRaw, gc_info: &mut GcInfo) {
-        let write = Modify::Delete(CF_DEFAULT, key);
+        let write = Modify::Delete(CF_DEFAULT, key, None);
         raw_modifies.write_size += write.size();
         raw_modifies.modifies.push(write);
         gc_info.deleted_versions += 1;
@@ -1328,11 +1328,11 @@ mod tests {
         fn modify_on_kv_engine(&self, mut modifies: Vec<Modify>) -> kv::Result<()> {
             for modify in &mut modifies {
                 match modify {
-                    Modify::Delete(_, ref mut key) => {
+                    Modify::Delete(_, ref mut key, _) => {
                         let bytes = keys::data_key(key.as_encoded());
                         *key = Key::from_encoded(bytes);
                     }
-                    Modify::Put(_, ref mut key, _) => {
+                    Modify::Put(_, ref mut key, ..) => {
                         let bytes = keys::data_key(key.as_encoded());
                         *key = Key::from_encoded(bytes);
                     }
@@ -1358,10 +1358,10 @@ mod tests {
             callback: EngineCallback<()>,
         ) -> EngineResult<()> {
             batch.modifies.iter_mut().for_each(|modify| match modify {
-                Modify::Delete(_, ref mut key) => {
+                Modify::Delete(_, ref mut key, _) => {
                     *key = Key::from_encoded(keys::data_key(key.as_encoded()));
                 }
-                Modify::Put(_, ref mut key, _) => {
+                Modify::Put(_, ref mut key, ..) => {
                     *key = Key::from_encoded(keys::data_key(key.as_encoded()));
                 }
                 Modify::PessimisticLock(ref mut key, _) => {
@@ -1883,7 +1883,7 @@ mod tests {
                     }),
                 )
             })
-            .map(|(k, v)| Modify::Put(CF_DEFAULT, k, v))
+            .map(|(k, v)| Modify::Put(CF_DEFAULT, k, None, v))
             .collect();
 
         let ctx = Context {
@@ -1997,7 +1997,7 @@ mod tests {
         // Test rebuilding snapshot when GC write batch limit reached
         // (gc_info.is_completed == false). Build a key with versions that will
         // just reach the limit `MAX_TXN_WRITE_SIZE`.
-        let key_size = Modify::Delete(CF_WRITE, Key::from_raw(b"k2").append_ts(1.into())).size();
+        let key_size = Modify::Delete(CF_WRITE, Key::from_raw(b"k2"), Some(1.into())).size();
         // versions = ceil(MAX_TXN_WRITE_SIZE/write_size) + 3
         // Write CF: Put@N, Put@N-2,    Put@N-4, ... Put@5,   Put@3
         //                 ^            ^^^^^^^^^^^^^^^^^^^

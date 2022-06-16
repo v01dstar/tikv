@@ -1458,6 +1458,14 @@ mod tests {
             fn get_cf_opt(&self, _: ReadOptions, _: CfName, _: &Key) -> Result<Option<Value>> {
                 unimplemented!()
             }
+            fn get_val_ts_cf_opt(
+                &self,
+                _: ReadOptions,
+                _: CfName,
+                _: &Key,
+            ) -> Result<Option<(Value, TimeStamp)>> {
+                unimplemented!()
+            }
             fn iter(&self, _: CfName, _: IterOptions) -> Result<Self::Iter> {
                 unimplemented!()
             }

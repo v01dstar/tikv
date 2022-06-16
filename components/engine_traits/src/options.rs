@@ -2,10 +2,12 @@
 use std::ops::Bound;
 
 use tikv_util::keybuilder::KeyBuilder;
+use txn_types::TimeStamp;
 
 #[derive(Clone)]
 pub struct ReadOptions {
     fill_cache: bool,
+    timestamp: Option<TimeStamp>,
 }
 
 impl ReadOptions {
@@ -22,11 +24,24 @@ impl ReadOptions {
     pub fn set_fill_cache(&mut self, v: bool) {
         self.fill_cache = v;
     }
+
+    #[inline]
+    pub fn get_timestamp(&self) -> Option<TimeStamp> {
+        self.timestamp
+    }
+
+    #[inline]
+    pub fn set_timestamp(&mut self, ts: TimeStamp) {
+        self.timestamp = Some(ts);
+    }
 }
 
 impl Default for ReadOptions {
     fn default() -> ReadOptions {
-        ReadOptions { fill_cache: true }
+        ReadOptions {
+            fill_cache: true,
+            timestamp: None,
+        }
     }
 }
 
@@ -85,6 +100,8 @@ pub struct IterOptions {
     // never fail a request as incomplete, even on skipping too many keys.
     // It's used to avoid encountering too many tombstones when seeking.
     max_skippable_internal_keys: u64,
+    timestamp: Option<TimeStamp>,
+    iter_start_ts: Option<TimeStamp>,
 }
 
 impl IterOptions {
@@ -103,6 +120,8 @@ impl IterOptions {
             key_only: false,
             seek_mode: SeekMode::TotalOrder,
             max_skippable_internal_keys: 0,
+            timestamp: None,
+            iter_start_ts: None,
         }
     }
 
@@ -237,6 +256,26 @@ impl IterOptions {
     pub fn set_max_skippable_internal_keys(&mut self, threshold: u64) {
         self.max_skippable_internal_keys = threshold;
     }
+
+    #[inline]
+    pub fn set_timestamp(&mut self, timestamp: TimeStamp) {
+        self.timestamp = Some(timestamp);
+    }
+
+    #[inline]
+    pub fn timestamp(&self) -> Option<TimeStamp> {
+        self.timestamp
+    }
+
+    #[inline]
+    pub fn set_iter_start_ts(&mut self, timestamp: TimeStamp) {
+        self.iter_start_ts = Some(timestamp);
+    }
+
+    #[inline]
+    pub fn iter_start_ts(&self) -> Option<TimeStamp> {
+        self.iter_start_ts
+    }
 }
 
 impl Default for IterOptions {
@@ -251,6 +290,8 @@ impl Default for IterOptions {
             key_only: false,
             seek_mode: SeekMode::TotalOrder,
             max_skippable_internal_keys: 0,
+            timestamp: None,
+            iter_start_ts: None,
         }
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
+// Copyright 2020 TiKV Project Authors. Lic&ensed under Apache-2.0.
 
 use std::path::Path;
 
@@ -6,6 +6,7 @@ use engine_traits::{
     MiscExt, Range, RangePropertiesExt, Result, CF_DEFAULT, CF_LOCK, CF_WRITE, LARGE_CFS,
 };
 use tikv_util::{box_err, box_try, debug, info};
+use txn_types::TimeStamp;
 
 use crate::{
     engine::RocksEngine,
@@ -41,10 +42,31 @@ impl RangePropertiesExt for RocksEngine {
         let start_key = &range.start_key;
         let end_key = &range.end_key;
         let mut total_keys = 0;
-        let (mem_keys, _) = box_try!(self.get_approximate_memtable_stats_cf(cfname, &range));
+        let (mem_keys, collection) = if cfname == CF_WRITE {
+            let mut ts_encoded_start = start_key.to_vec();
+            ts_encoded_start.extend(TimeStamp::max().into_encoded().iter());
+            let mut ts_encoded_end = end_key.to_vec();
+            ts_encoded_end.extend(TimeStamp::max().into_encoded().iter());
+            let (mem_keys, _) = box_try!(self.get_approximate_memtable_stats_cf(
+                cfname,
+                &Range {
+                    start_key: &ts_encoded_start,
+                    end_key: &ts_encoded_end
+                }
+            ));
+            (
+                mem_keys,
+                box_try!(self.get_range_properties_cf(cfname, &ts_encoded_start, &ts_encoded_end)),
+            )
+        } else {
+            let (mem_keys, _) = box_try!(self.get_approximate_memtable_stats_cf(cfname, &range));
+            (
+                mem_keys,
+                box_try!(self.get_range_properties_cf(cfname, start_key, end_key)),
+            )
+        };
         total_keys += mem_keys;
 
-        let collection = box_try!(self.get_range_properties_cf(cfname, start_key, end_key));
         for (_, v) in collection.iter() {
             let props = box_try!(RangeProperties::decode(v.user_collected_properties()));
             total_keys += props.get_approximate_keys_in_range(start_key, end_key);
@@ -101,10 +123,30 @@ impl RangePropertiesExt for RocksEngine {
         let start_key = &range.start_key;
         let end_key = &range.end_key;
         let mut total_size = 0;
-        let (_, mem_size) = box_try!(self.get_approximate_memtable_stats_cf(cfname, &range));
+        let (mem_size, collection) = if cfname == CF_WRITE {
+            let mut ts_encoded_start = start_key.to_vec();
+            ts_encoded_start.extend(TimeStamp::max().into_encoded().iter());
+            let mut ts_encoded_end = end_key.to_vec();
+            ts_encoded_end.extend(TimeStamp::max().into_encoded().iter());
+            let (_, mem_size) = box_try!(self.get_approximate_memtable_stats_cf(
+                cfname,
+                &Range {
+                    start_key: &ts_encoded_start,
+                    end_key: &ts_encoded_end
+                }
+            ));
+            (
+                mem_size,
+                box_try!(self.get_range_properties_cf(cfname, &ts_encoded_start, &ts_encoded_end)),
+            )
+        } else {
+            let (_, mem_size) = box_try!(self.get_approximate_memtable_stats_cf(cfname, &range));
+            (
+                mem_size,
+                box_try!(self.get_range_properties_cf(cfname, start_key, end_key)),
+            )
+        };
         total_size += mem_size;
-
-        let collection = box_try!(self.get_range_properties_cf(cfname, start_key, end_key));
         for (_, v) in collection.iter() {
             let props = box_try!(RangeProperties::decode(v.user_collected_properties()));
             total_size += props.get_approximate_size_in_range(start_key, end_key);

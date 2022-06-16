@@ -193,6 +193,13 @@ impl Mutable for RocksWriteBatchVec {
         self.wbs[self.index].put_cf(handle, key, value).map_err(r2e)
     }
 
+    fn put_cf_with_ts(&mut self, cf: &str, key: &[u8], ts: &[u8], value: &[u8]) -> Result<()> {
+        let handle = get_cf_handle(self.db.as_ref(), cf)?;
+        self.wbs[self.index]
+            .put_cf_with_ts(handle, key, ts, value)
+            .map_err(r2e)
+    }
+
     fn delete(&mut self, key: &[u8]) -> Result<()> {
         self.check_switch_batch();
         self.wbs[self.index].delete(key).map_err(r2e)
@@ -202,6 +209,13 @@ impl Mutable for RocksWriteBatchVec {
         self.check_switch_batch();
         let handle = get_cf_handle(self.db.as_ref(), cf)?;
         self.wbs[self.index].delete_cf(handle, key).map_err(r2e)
+    }
+
+    fn delete_cf_with_ts(&mut self, cf: &str, key: &[u8], ts: &[u8]) -> Result<()> {
+        let handle = get_cf_handle(self.db.as_ref(), cf)?;
+        self.wbs[self.index]
+            .delete_cf_with_ts(handle, key, ts)
+            .map_err(r2e)
     }
 
     fn delete_range(&mut self, begin_key: &[u8], end_key: &[u8]) -> Result<()> {

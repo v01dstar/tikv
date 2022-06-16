@@ -26,12 +26,14 @@ pub trait Mutable: Send {
 
     /// Write a key/value in a given column family
     fn put_cf(&mut self, cf: &str, key: &[u8], value: &[u8]) -> Result<()>;
+    fn put_cf_with_ts(&mut self, cf: &str, key: &[u8], ts: &[u8], value: &[u8]) -> Result<()>;
 
     /// Delete a key/value in the default column family
     fn delete(&mut self, key: &[u8]) -> Result<()>;
 
     /// Delete a key/value in a given column family
     fn delete_cf(&mut self, cf: &str, key: &[u8]) -> Result<()>;
+    fn delete_cf_with_ts(&mut self, cf: &str, key: &[u8], ts: &[u8]) -> Result<()>;
 
     /// Delete a range of key/values in the default column family
     fn delete_range(&mut self, begin_key: &[u8], end_key: &[u8]) -> Result<()>;

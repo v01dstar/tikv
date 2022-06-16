@@ -164,6 +164,21 @@ impl Peekable for RocksEngine {
             .map_err(r2e)?;
         Ok(v.map(RocksDbVector::from_raw))
     }
+
+    fn get_value_ts_cf_opt(
+        &self,
+        opts: &ReadOptions,
+        cf: &str,
+        key: &[u8],
+    ) -> Result<Option<(Self::DbVector, Vec<u8>)>> {
+        let opt: RocksReadOptions = opts.into();
+        let handle = get_cf_handle(&self.db, cf)?;
+        let v = self
+            .db
+            .get_cf_opt_ts(handle, key, &opt.into_raw())
+            .map_err(r2e)?;
+        Ok(v.map(|(v, ts)| (RocksDbVector::from_raw(v), ts)))
+    }
 }
 
 impl SyncMutable for RocksEngine {

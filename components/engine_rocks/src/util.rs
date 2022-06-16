@@ -1,13 +1,14 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{fs, path::Path, str::FromStr, sync::Arc};
+use std::{fs, mem::size_of, path::Path, str::FromStr, sync::Arc};
 
 use engine_traits::{Engines, Range, Result, CF_DEFAULT};
 use rocksdb::{
     load_latest_options, CColumnFamilyDescriptor, CFHandle, ColumnFamilyOptions, Env,
-    Range as RocksRange, SliceTransform, DB,
+    Range as RocksRange, SliceTransform, TimestampAwareComparator, DB,
 };
 use slog_global::warn;
+use txn_types::TimeStamp;
 
 use crate::{
     cf_options::RocksCfOptions, db_options::RocksDbOptions, engine::RocksEngine, r2e,
@@ -433,5 +434,58 @@ mod tests {
         assert!(!tmp_cf_opts.get_level_compaction_dynamic_level_bytes());
         let tmp_cf_opts = db.get_options_cf("cf_dynamic_level_bytes").unwrap();
         assert!(tmp_cf_opts.get_level_compaction_dynamic_level_bytes());
+    }
+}
+pub struct ComparatorWithTs {
+    timestamp_size: usize,
+}
+
+impl ComparatorWithTs {
+    pub fn new() -> Self {
+        ComparatorWithTs {
+            timestamp_size: size_of::<TimeStamp>() / size_of::<u8>(),
+        }
+    }
+}
+
+#[inline]
+fn extract_timestamp_from_user_key<'a>(key: &'a [u8], timestamp_size: &'a usize) -> &'a [u8] {
+    &key[key.len() - timestamp_size..]
+}
+#[inline]
+fn strip_timestamp_from_user_key<'a>(key: &'a [u8], timestamp_size: &'a usize) -> &'a [u8] {
+    &key[..key.len() - timestamp_size]
+}
+impl TimestampAwareComparator for ComparatorWithTs {
+    fn compare(&self, a: &[u8], b: &[u8]) -> i32 {
+        let ret = self.compare_without_timestamp(a, true, b, true);
+        if ret != 0 {
+            return ret;
+        }
+        // Newer version stands in the front.
+        return -self.compare_timestamp(
+            extract_timestamp_from_user_key(a, &self.timestamp_size),
+            extract_timestamp_from_user_key(b, &self.timestamp_size),
+        );
+    }
+    fn compare_timestamp(&self, a: &[u8], b: &[u8]) -> i32 {
+        a.cmp(b) as i32
+    }
+    fn compare_without_timestamp(&self, a: &[u8], a_has_ts: bool, b: &[u8], b_has_ts: bool) -> i32 {
+        assert!(!a_has_ts || a.len() > self.timestamp_size);
+        if b_has_ts && b.len() <= self.timestamp_size {
+            panic!("should not happen");
+        }
+        let raw_a = if a_has_ts {
+            strip_timestamp_from_user_key(a, &self.timestamp_size)
+        } else {
+            a
+        };
+        let raw_b = if b_has_ts {
+            strip_timestamp_from_user_key(b, &self.timestamp_size)
+        } else {
+            b
+        };
+        raw_a.cmp(raw_b) as i32
     }
 }

@@ -213,6 +213,25 @@ where
             .get_value_cf_opt(opts, cf, &data_key)
             .map_err(|e| self.handle_get_value_error(e, cf, key))
     }
+
+    fn get_value_ts_cf_opt(
+        &self,
+        opts: &ReadOptions,
+        cf: &str,
+        key: &[u8],
+    ) -> EngineResult<Option<(Self::DbVector, Vec<u8>)>> {
+        check_key_in_range(
+            key,
+            self.region.get_id(),
+            self.region.get_start_key(),
+            self.region.get_end_key(),
+        )
+        .map_err(|e| EngineError::Other(box_err!(e)))?;
+        let data_key = keys::data_key(key);
+        self.snap
+            .get_value_ts_cf_opt(opts, cf, &data_key)
+            .map_err(|e| self.handle_get_value_error(e, cf, key))
+    }
 }
 
 impl<S> RegionSnapshot<S>
@@ -328,6 +347,11 @@ where
     #[inline]
     pub fn key(&self) -> &[u8] {
         keys::origin_key(self.iter.key())
+    }
+
+    #[inline]
+    pub fn ts(&self) -> Option<&[u8]> {
+        self.iter.timestamp()
     }
 
     #[inline]

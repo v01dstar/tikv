@@ -223,6 +223,10 @@ fn collect_ranges_need_compact(
                 // Move to next range.
                 continue;
             }
+            println!(
+                "timestamp====compact start {:?}, compact end{:?}",
+                compact_start, compact_end,
+            );
         }
 
         // Current range doesn't need compacting, save previous range that need

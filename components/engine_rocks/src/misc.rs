@@ -2,10 +2,11 @@
 
 use engine_traits::{
     CfNamesExt, DeleteStrategy, ImportExt, IterOptions, Iterable, Iterator, MiscExt, Mutable,
-    Range, Result, SstWriter, SstWriterBuilder, WriteBatch, WriteBatchExt, ALL_CFS,
+    Range, Result, SstWriter, SstWriterBuilder, WriteBatch, WriteBatchExt, ALL_CFS, CF_WRITE,
 };
 use rocksdb::Range as RocksRange;
 use tikv_util::{box_try, keybuilder::KeyBuilder};
+use txn_types::TimeStamp;
 
 use crate::{
     engine::RocksEngine, r2e, rocks_metrics_defs::*, sst::RocksSstWriterBuilder, util,
@@ -40,9 +41,14 @@ impl RocksEngine {
             // Titan to avoid referring to missing blob files.
             opts.set_key_only(true);
         }
+        if cf == CF_WRITE {
+            opts.set_timestamp(TimeStamp::max());
+            opts.set_iter_start_ts(TimeStamp::zero());
+        }
 
         let mut writer_wrapper: Option<RocksSstWriter> = None;
         let mut data: Vec<Vec<u8>> = vec![];
+        let mut ts: Vec<Vec<u8>> = vec![];
         let mut last_end_key: Option<Vec<u8>> = None;
         for r in ranges {
             // There may be a range overlap with next range
@@ -62,17 +68,32 @@ impl RocksEngine {
                     break;
                 }
                 if let Some(writer) = writer_wrapper.as_mut() {
-                    writer.delete(it.key())?;
+                    if cf == CF_WRITE {
+                        writer.delete_with_ts(it.key(), it.timestamp().unwrap())?;
+                    } else {
+                        writer.delete(it.key())?;
+                    }
                 } else {
                     data.push(it.key().to_vec());
+                    if cf == CF_WRITE {
+                        ts.push(it.timestamp().unwrap().to_vec());
+                    }
                 }
                 if data.len() > MAX_DELETE_COUNT_BY_KEY {
                     let builder = RocksSstWriterBuilder::new().set_db(self).set_cf(cf);
                     let mut writer = builder.build(sst_path.as_str())?;
-                    for key in data.iter() {
-                        writer.delete(key)?;
+                    if cf == CF_WRITE {
+                        for (key, timestamp) in data.iter().zip(ts.iter()) {
+                            writer.delete_with_ts(key, timestamp)?;
+                        }
+                    } else {
+                        for key in data.iter() {
+                            writer.delete(key)?;
+                        }
                     }
+
                     data.clear();
+                    ts.clear();
                     writer_wrapper = Some(writer);
                 }
                 it_valid = it.next()?;
@@ -84,11 +105,21 @@ impl RocksEngine {
             self.ingest_external_file_cf(cf, &[sst_path.as_str()])?;
         } else {
             let mut wb = self.write_batch();
-            for key in data.iter() {
-                wb.delete_cf(cf, key)?;
-                if wb.count() >= Self::WRITE_BATCH_MAX_KEYS {
-                    wb.write()?;
-                    wb.clear();
+            if cf == CF_WRITE {
+                for (key, timestamp) in data.iter().zip(ts.iter()) {
+                    wb.delete_cf_with_ts(cf, key, timestamp)?;
+                    if wb.count() >= Self::WRITE_BATCH_MAX_KEYS {
+                        wb.write()?;
+                        wb.clear();
+                    }
+                }
+            } else {
+                for key in data.iter() {
+                    wb.delete_cf(cf, key)?;
+                    if wb.count() >= Self::WRITE_BATCH_MAX_KEYS {
+                        wb.write()?;
+                        wb.clear();
+                    }
                 }
             }
             if wb.count() > 0 {
@@ -107,17 +138,33 @@ impl RocksEngine {
             // Titan to avoid referring to missing blob files.
             opts.set_key_only(true);
         }
+        if cf == CF_WRITE {
+            opts.set_timestamp(TimeStamp::max());
+            opts.set_iter_start_ts(TimeStamp::zero());
+        }
         let mut it = self.iterator_opt(cf, opts)?;
         let mut it_valid = it.seek(range.start_key)?;
         let mut wb = self.write_batch();
-        while it_valid {
-            wb.delete_cf(cf, it.key())?;
-            if wb.count() >= Self::WRITE_BATCH_MAX_KEYS {
-                wb.write()?;
-                wb.clear();
+        if cf == CF_WRITE {
+            while it_valid {
+                wb.delete_cf_with_ts(cf, it.key(), it.timestamp().unwrap())?;
+                if wb.count() >= Self::WRITE_BATCH_MAX_KEYS {
+                    wb.write()?;
+                    wb.clear();
+                }
+                it_valid = it.next()?;
             }
-            it_valid = it.next()?;
+        } else {
+            while it_valid {
+                wb.delete_cf(cf, it.key())?;
+                if wb.count() >= Self::WRITE_BATCH_MAX_KEYS {
+                    wb.write()?;
+                    wb.clear();
+                }
+                it_valid = it.next()?;
+            }
         }
+
         if wb.count() > 0 {
             wb.write()?;
         }

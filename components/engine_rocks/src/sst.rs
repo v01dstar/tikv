@@ -4,7 +4,7 @@ use std::{path::PathBuf, rc::Rc, sync::Arc};
 
 use engine_traits::{
     Error, ExternalSstFileInfo, IterOptions, Iterable, Iterator, Result, SstCompressionType,
-    SstExt, SstMetaInfo, SstReader, SstWriter, SstWriterBuilder, CF_DEFAULT,
+    SstExt, SstMetaInfo, SstReader, SstWriter, SstWriterBuilder, CF_DEFAULT, CF_WRITE,
 };
 use fail::fail_point;
 use kvproto::import_sstpb::SstMeta;
@@ -14,7 +14,9 @@ use rocksdb::{
     SstFileWriter, DB,
 };
 
-use crate::{engine::RocksEngine, options::RocksReadOptions, r2e};
+// FIXME: Move RocksSeekKey into a common module since
+// it's shared between multiple iterators
+use crate::{engine::RocksEngine, options::RocksReadOptions, r2e, util::ComparatorWithTs};
 
 impl SstExt for RocksEngine {
     type SstReader = RocksSstReader;
@@ -142,6 +144,10 @@ impl Iterator for RocksSstIterator {
         self.0.value()
     }
 
+    fn timestamp(&self) -> Option<&[u8]> {
+        self.0.ts()
+    }
+
     fn valid(&self) -> Result<bool> {
         self.0.valid().map_err(r2e)
     }
@@ -243,6 +249,12 @@ impl SstWriterBuilder<RocksEngine> for RocksSstWriterBuilder {
         // being used, we must set them empty or disabled.
         io_options.compression_per_level(&[]);
         io_options.bottommost_compression(DBCompressionType::Disable);
+        if self.cf.as_deref().unwrap_or(CF_DEFAULT) == CF_WRITE {
+            io_options
+                .add_timestamp_aware_comparator("tikv.ComparatorWithTs", 8, ComparatorWithTs::new())
+                .unwrap();
+        }
+
         let mut writer = SstFileWriter::new(EnvOptions::new(), io_options);
         fail_point!("on_open_sst_writer");
         writer.open(path).map_err(r2e)?;
@@ -263,8 +275,16 @@ impl SstWriter for RocksSstWriter {
         self.writer.put(key, val).map_err(r2e)
     }
 
+    fn put_with_ts(&mut self, key: &[u8], ts: &[u8], val: &[u8]) -> Result<()> {
+        self.writer.put_with_ts(key, ts, val).map_err(r2e)
+    }
+
     fn delete(&mut self, key: &[u8]) -> Result<()> {
         self.writer.delete(key).map_err(r2e)
+    }
+
+    fn delete_with_ts(&mut self, key: &[u8], ts: &[u8]) -> Result<()> {
+        self.writer.delete_with_ts(key, ts).map_err(r2e)
     }
 
     fn file_size(&mut self) -> u64 {

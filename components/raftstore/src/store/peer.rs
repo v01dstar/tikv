@@ -4427,6 +4427,7 @@ where
                 "peer_id" => self.peer.get_id(),
                 "from" => from,
                 "pending_snapshot" => pending_snapshot,
+                "is_handling" => self.is_handling_snapshot(),
                 "disk_usage" => ?ctx.self_disk_usage,
             );
             return;

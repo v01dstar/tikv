@@ -3,7 +3,7 @@
 // #[PerformanceCriticalPath
 use std::borrow::Cow;
 
-use engine_traits::{CF_DEFAULT, CF_LOCK, CF_WRITE};
+use engine_traits::{ReadOptions, CF_DEFAULT, CF_LOCK, CF_WRITE};
 use kvproto::kvrpcpb::IsolationLevel;
 use txn_types::{Key, Lock, LockType, TimeStamp, TsSet, Value, WriteRef, WriteType};
 
@@ -23,11 +23,12 @@ pub struct PointGetterBuilder<S: Snapshot> {
     bypass_locks: TsSet,
     access_locks: TsSet,
     check_has_newer_ts_data: bool,
+    enable_user_timestamp: bool,
 }
 
 impl<S: Snapshot> PointGetterBuilder<S> {
     /// Initialize a new `PointGetterBuilder`.
-    pub fn new(snapshot: S, ts: TimeStamp) -> Self {
+    pub fn new(snapshot: S, ts: TimeStamp, enable_user_timestamp: bool) -> Self {
         Self {
             snapshot,
             fill_cache: true,
@@ -37,6 +38,7 @@ impl<S: Snapshot> PointGetterBuilder<S> {
             bypass_locks: Default::default(),
             access_locks: Default::default(),
             check_has_newer_ts_data: false,
+            enable_user_timestamp,
         }
     }
 
@@ -106,11 +108,16 @@ impl<S: Snapshot> PointGetterBuilder<S> {
 
     /// Build `PointGetter` from the current configuration.
     pub fn build(self) -> Result<PointGetter<S>> {
-        let write_cursor = CursorBuilder::new(&self.snapshot, CF_WRITE)
-            .fill_cache(self.fill_cache)
-            .prefix_seek(true)
-            .scan_mode(ScanMode::Mixed)
-            .build()?;
+        let write_cursor = if !self.enable_user_timestamp {
+            let write_cursor = CursorBuilder::new(&self.snapshot, CF_WRITE)
+                .fill_cache(self.fill_cache)
+                .prefix_seek(true)
+                .scan_mode(ScanMode::Mixed)
+                .build()?;
+            Some(write_cursor)
+        } else {
+            None
+        };
 
         Ok(PointGetter {
             snapshot: self.snapshot,
@@ -148,7 +155,7 @@ pub struct PointGetter<S: Snapshot> {
 
     statistics: Statistics,
 
-    write_cursor: Cursor<S::Iter>,
+    write_cursor: Option<Cursor<S::Iter>>,
 }
 
 impl<S: Snapshot> PointGetter<S> {
@@ -217,11 +224,145 @@ impl<S: Snapshot> PointGetter<S> {
         }
     }
 
+    fn load_data(&mut self, user_key: &Key) -> Result<Option<Value>> {
+        if self.write_cursor.is_some() {
+            return self.load_data_by_seek(user_key);
+        }
+        let mut ts = self.ts;
+        let newest_write = if self.met_newer_ts_data == NewerTsCheckState::NotMetYet
+            || self.isolation_level == IsolationLevel::RcCheckTs
+        {
+            let mut read_opts = ReadOptions::new();
+            read_opts.set_timestamp(TimeStamp::max());
+            let result = self
+                .snapshot
+                .get_val_ts_cf_opt(read_opts, CF_WRITE, user_key)?;
+            if let Some((value, commit_ts)) = result {
+                let write = WriteRef::parse(&value)?;
+                if commit_ts > ts {
+                    if self.met_newer_ts_data == NewerTsCheckState::NotMetYet {
+                        self.met_newer_ts_data = NewerTsCheckState::Met;
+                    }
+                    if self.isolation_level == IsolationLevel::RcCheckTs {
+                        // TODO: the more write recent version with `LOCK` or `ROLLBACK` write type
+                        //       could be skipped.
+                        return Err(WriteConflict {
+                            start_ts: ts,
+                            conflict_start_ts: Default::default(),
+                            conflict_commit_ts: commit_ts,
+                            key: user_key.clone().into_encoded(),
+                            primary: vec![],
+                        }
+                        .into());
+                    }
+                }
+                Some((value, commit_ts))
+            } else {
+                return Ok(None);
+            }
+        } else {
+            None
+        };
+
+        // Shortcut. If the function has done reading the newest version and the newest
+        // version is older than the timestamp the caller requested, it may be
+        // the one caller needs.
+        if let Some((value, commit_ts)) = newest_write {
+            if commit_ts < ts {
+                let write = WriteRef::parse(&value)?;
+                if !write.check_gc_fence_as_latest_version(self.ts) {
+                    return Ok(None);
+                }
+                match write.write_type {
+                    WriteType::Put => {
+                        self.statistics.write.processed_keys += 1;
+                        resource_metering::record_read_keys(1);
+
+                        if self.omit_value {
+                            return Ok(Some(vec![]));
+                        }
+                        match write.short_value {
+                            Some(value) => {
+                                // Value is carried in `write`.
+                                self.statistics.processed_size += user_key.len() + value.len();
+                                return Ok(Some(value.to_vec()));
+                            }
+                            None => {
+                                let start_ts = write.start_ts;
+                                let value = self.load_data_from_default_cf(start_ts, user_key)?;
+                                self.statistics.processed_size += user_key.len() + value.len();
+                                return Ok(Some(value));
+                            }
+                        }
+                    }
+                    WriteType::Delete => {
+                        return Ok(None);
+                    }
+                    WriteType::Lock | WriteType::Rollback => {
+                        ts = write.start_ts;
+                        ts.decr();
+                    }
+                }
+            } else {
+                info!("debug user timestamp, point getter, newest write cannot be used"; "commit_ts" => ?commit_ts, "ts" => ?ts);
+            }
+        }
+
+        loop {
+            let mut read_opts = ReadOptions::new();
+            read_opts.set_timestamp(ts);
+            let result = self.snapshot.get_cf_opt(read_opts, CF_WRITE, user_key)?;
+            if let Some(value) = result {
+                let write = WriteRef::parse(&value)?;
+
+                if !write.check_gc_fence_as_latest_version(self.ts) {
+                    return Ok(None);
+                }
+
+                match write.write_type {
+                    WriteType::Put => {
+                        self.statistics.write.processed_keys += 1;
+                        resource_metering::record_read_keys(1);
+
+                        if self.omit_value {
+                            return Ok(Some(vec![]));
+                        }
+                        match write.short_value {
+                            Some(value) => {
+                                // Value is carried in `write`.
+                                self.statistics.processed_size += user_key.len() + value.len();
+                                return Ok(Some(value.to_vec()));
+                            }
+                            None => {
+                                let start_ts = write.start_ts;
+                                let value = self.load_data_from_default_cf(start_ts, user_key)?;
+                                self.statistics.processed_size += user_key.len() + value.len();
+                                return Ok(Some(value));
+                            }
+                        }
+                    }
+                    WriteType::Delete => {
+                        return Ok(None);
+                    }
+                    WriteType::Lock | WriteType::Rollback => {
+                        info!("debug user timestamp, point getter, write type is lock or rollback"; "write_type" => ?write.write_type);
+                        ts = write.start_ts;
+                        ts.decr();
+                    }
+                }
+            } else {
+                return Ok(None);
+            }
+        }
+    }
+
     /// Load the value.
     ///
     /// First, a correct version info in the Write CF will be sought. Then,
     /// value will be loaded from Default CF if necessary.
-    fn load_data(&mut self, user_key: &Key) -> Result<Option<Value>> {
+    fn load_data_by_seek(&mut self, user_key: &Key) -> Result<Option<Value>> {
+        assert!(self.write_cursor.is_some());
+        let write_cursor = self.write_cursor.as_mut().unwrap();
         let mut use_near_seek = false;
         let mut seek_key = user_key.clone();
 
@@ -229,16 +370,13 @@ impl<S: Snapshot> PointGetter<S> {
             || self.isolation_level == IsolationLevel::RcCheckTs
         {
             seek_key = seek_key.append_ts(TimeStamp::max());
-            if !self
-                .write_cursor
-                .seek(&seek_key, &mut self.statistics.write)?
-            {
+            if !write_cursor.seek(&seek_key, &mut self.statistics.write)? {
                 return Ok(None);
             }
             seek_key = seek_key.truncate_ts()?;
             use_near_seek = true;
 
-            let cursor_key = self.write_cursor.key(&mut self.statistics.write);
+            let cursor_key = write_cursor.key(&mut self.statistics.write);
             // No need to compare user key because it uses prefix seek.
             let key_commit_ts = Key::decode_ts_from(cursor_key)?;
             if key_commit_ts > self.ts {
@@ -262,19 +400,16 @@ impl<S: Snapshot> PointGetter<S> {
 
         seek_key = seek_key.append_ts(self.ts);
         let data_found = if use_near_seek {
-            if self.write_cursor.key(&mut self.statistics.write) >= seek_key.as_encoded().as_slice()
-            {
+            if write_cursor.key(&mut self.statistics.write) >= seek_key.as_encoded().as_slice() {
                 // we call near_seek with ScanMode::Mixed set, if the key() > seek_key,
                 // it will call prev() several times, whereas we just want to seek forward here
                 // so cmp them in advance
                 true
             } else {
-                self.write_cursor
-                    .near_seek(&seek_key, &mut self.statistics.write)?
+                write_cursor.near_seek(&seek_key, &mut self.statistics.write)?
             }
         } else {
-            self.write_cursor
-                .seek(&seek_key, &mut self.statistics.write)?
+            write_cursor.seek(&seek_key, &mut self.statistics.write)?
         };
         if !data_found {
             return Ok(None);
@@ -282,7 +417,7 @@ impl<S: Snapshot> PointGetter<S> {
 
         loop {
             // No need to compare user key because it uses prefix seek.
-            let write = WriteRef::parse(self.write_cursor.value(&mut self.statistics.write))?;
+            let write = WriteRef::parse(write_cursor.value(&mut self.statistics.write))?;
 
             if !write.check_gc_fence_as_latest_version(self.ts) {
                 return Ok(None);
@@ -318,7 +453,7 @@ impl<S: Snapshot> PointGetter<S> {
                 }
             }
 
-            if !self.write_cursor.next(&mut self.statistics.write) {
+            if !write_cursor.next(&mut self.statistics.write) {
                 return Ok(None);
             }
         }
@@ -412,7 +547,7 @@ mod tests {
         iso_level: IsolationLevel,
     ) -> PointGetter<E::Snap> {
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        PointGetterBuilder::new(snapshot, ts)
+        PointGetterBuilder::new(snapshot, ts, true)
             .isolation_level(iso_level)
             .build()
             .unwrap()
@@ -436,7 +571,7 @@ mod tests {
     ) {
         let snapshot = engine.snapshot(Default::default()).unwrap();
         let ts = getter_ts.into();
-        let mut point_getter = PointGetterBuilder::new(snapshot.clone(), ts)
+        let mut point_getter = PointGetterBuilder::new(snapshot.clone(), ts, false)
             .isolation_level(IsolationLevel::Si)
             .check_has_newer_ts_data(true)
             .build()
@@ -450,7 +585,7 @@ mod tests {
         };
         assert_eq!(expected, point_getter.met_newer_ts_data());
 
-        let mut point_getter = PointGetterBuilder::new(snapshot, ts)
+        let mut point_getter = PointGetterBuilder::new(snapshot, ts, false)
             .isolation_level(IsolationLevel::Si)
             .check_has_newer_ts_data(false)
             .build()
@@ -735,7 +870,7 @@ mod tests {
             access_locks: Default::default(),
             met_newer_ts_data: NewerTsCheckState::NotMetYet,
             statistics: Statistics::default(),
-            write_cursor,
+            write_cursor: Some(write_cursor),
         };
         must_get_value(&mut getter, b"foo", b"bar");
         let s = getter.take_statistics();
@@ -890,7 +1025,7 @@ mod tests {
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
 
-        let mut getter = PointGetterBuilder::new(snapshot, 4.into())
+        let mut getter = PointGetterBuilder::new(snapshot, 4.into(), false)
             .isolation_level(IsolationLevel::Si)
             .omit_value(true)
             .build()
@@ -945,7 +1080,7 @@ mod tests {
         must_prewrite_delete(&engine, key, key, 30);
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut getter = PointGetterBuilder::new(snapshot, 60.into())
+        let mut getter = PointGetterBuilder::new(snapshot, 60.into(), false)
             .isolation_level(IsolationLevel::Si)
             .bypass_locks(TsSet::from_u64s(vec![30, 40, 50]))
             .build()
@@ -953,7 +1088,7 @@ mod tests {
         must_get_value(&mut getter, key, val);
 
         let snapshot = engine.snapshot(Default::default()).unwrap();
-        let mut getter = PointGetterBuilder::new(snapshot, 60.into())
+        let mut getter = PointGetterBuilder::new(snapshot, 60.into(), false)
             .isolation_level(IsolationLevel::Si)
             .bypass_locks(TsSet::from_u64s(vec![31, 29]))
             .build()
@@ -966,7 +1101,7 @@ mod tests {
         let engine = TestEngineBuilder::new().build().unwrap();
         let build_getter = |ts: u64, bypass_locks, access_locks| {
             let snapshot = engine.snapshot(Default::default()).unwrap();
-            PointGetterBuilder::new(snapshot, ts.into())
+            PointGetterBuilder::new(snapshot, ts.into(), true)
                 .isolation_level(IsolationLevel::Si)
                 .bypass_locks(TsSet::from_u64s(bypass_locks))
                 .access_locks(TsSet::from_u64s(access_locks))

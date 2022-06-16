@@ -443,8 +443,8 @@ fn batch<E: Engine>(ctx: SnapContext<'_>, engine: &E) {
         .write(
             ctx.pb_ctx,
             WriteData::from_modifies(vec![
-                Modify::Put(CF_DEFAULT, Key::from_raw(b"x"), b"1".to_vec()),
-                Modify::Put(CF_DEFAULT, Key::from_raw(b"y"), b"2".to_vec()),
+                Modify::Put(CF_DEFAULT, Key::from_raw(b"x"), None, b"1".to_vec()),
+                Modify::Put(CF_DEFAULT, Key::from_raw(b"y"), None, b"2".to_vec()),
             ]),
         )
         .unwrap();
@@ -455,8 +455,8 @@ fn batch<E: Engine>(ctx: SnapContext<'_>, engine: &E) {
         .write(
             ctx.pb_ctx,
             WriteData::from_modifies(vec![
-                Modify::Delete(CF_DEFAULT, Key::from_raw(b"x")),
-                Modify::Delete(CF_DEFAULT, Key::from_raw(b"y")),
+                Modify::Delete(CF_DEFAULT, Key::from_raw(b"x"), None),
+                Modify::Delete(CF_DEFAULT, Key::from_raw(b"y"), None),
             ]),
         )
         .unwrap();

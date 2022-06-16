@@ -24,6 +24,7 @@ mod stats;
 use std::{
     cell::UnsafeCell,
     error,
+    mem::size_of,
     num::NonZeroU64,
     ptr, result,
     sync::Arc,
@@ -32,7 +33,7 @@ use std::{
 
 use engine_traits::{
     CfName, IterOptions, KvEngine as LocalEngine, Mutable, MvccProperties, ReadOptions, WriteBatch,
-    CF_DEFAULT, CF_LOCK,
+    CF_DEFAULT, CF_LOCK, CF_WRITE,
 };
 use error_code::{self, ErrorCode, ErrorCodeExt};
 use futures::prelude::*;
@@ -69,8 +70,8 @@ pub type Result<T> = result::Result<T, Error>;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Modify {
-    Delete(CfName, Key),
-    Put(CfName, Key, Value),
+    Delete(CfName, Key, Option<TimeStamp>),
+    Put(CfName, Key, Option<TimeStamp>, Value),
     PessimisticLock(Key, PessimisticLock),
     // cf_name, start_key, end_key, notify_only
     DeleteRange(CfName, Key, Key, bool),
@@ -79,7 +80,7 @@ pub enum Modify {
 impl Modify {
     pub fn size(&self) -> usize {
         let cf = match self {
-            Modify::Delete(cf, _) => cf,
+            Modify::Delete(cf, ..) => cf,
             Modify::Put(cf, ..) => cf,
             Modify::PessimisticLock(..) => &CF_LOCK,
             Modify::DeleteRange(..) => unreachable!(),
@@ -87,8 +88,20 @@ impl Modify {
         let cf_size = if cf == &CF_DEFAULT { 0 } else { cf.len() };
 
         match self {
-            Modify::Delete(_, k) => cf_size + k.as_encoded().len(),
-            Modify::Put(_, k, v) => cf_size + k.as_encoded().len() + v.len(),
+            Modify::Delete(_, k, t) => {
+                if t.is_some() {
+                    cf_size + k.as_encoded().len() + size_of::<TimeStamp>()
+                } else {
+                    cf_size + k.as_encoded().len()
+                }
+            }
+            Modify::Put(_, k, t, v) => {
+                if t.is_some() {
+                    cf_size + k.as_encoded().len() + v.len() + size_of::<TimeStamp>()
+                } else {
+                    cf_size + k.as_encoded().len() + v.len()
+                }
+            }
             Modify::PessimisticLock(k, _) => cf_size + k.as_encoded().len(), // FIXME: inaccurate
             Modify::DeleteRange(..) => unreachable!(),
         }
@@ -96,8 +109,8 @@ impl Modify {
 
     pub fn key(&self) -> &Key {
         match self {
-            Modify::Delete(_, ref k) => k,
-            Modify::Put(_, ref k, _) => k,
+            Modify::Delete(_, ref k, _) => k,
+            Modify::Put(_, ref k, ..) => k,
             Modify::PessimisticLock(ref k, _) => k,
             Modify::DeleteRange(..) => unreachable!(),
         }
@@ -108,19 +121,27 @@ impl From<Modify> for raft_cmdpb::Request {
     fn from(m: Modify) -> raft_cmdpb::Request {
         let mut req = raft_cmdpb::Request::default();
         match m {
-            Modify::Delete(cf, k) => {
+            Modify::Delete(cf, k, t) => {
                 let mut delete = raft_cmdpb::DeleteRequest::default();
                 delete.set_key(k.into_encoded());
                 if cf != CF_DEFAULT {
                     delete.set_cf(cf.to_string());
                 }
+                if let Some(ts) = t {
+                    delete.set_ts(ts.into_encoded());
+                }
                 req.set_cmd_type(raft_cmdpb::CmdType::Delete);
                 req.set_delete(delete);
             }
-            Modify::Put(cf, k, v) => {
+            Modify::Put(cf, k, t, v) => {
                 let mut put = raft_cmdpb::PutRequest::default();
                 put.set_key(k.into_encoded());
                 put.set_value(v);
+                if cf == CF_WRITE {
+                    if let Some(ts) = t {
+                        put.set_ts(ts.into_encoded());
+                    }
+                }
                 if cf != CF_DEFAULT {
                     put.set_cf(cf.to_string());
                 }
@@ -169,16 +190,28 @@ impl From<raft_cmdpb::Request> for Modify {
         match req.get_cmd_type() {
             raft_cmdpb::CmdType::Delete => {
                 let delete = req.mut_delete();
+                let ts = if delete.get_ts().len() != 0 {
+                    Some(TimeStamp::from_encoded(delete.take_ts()))
+                } else {
+                    None
+                };
                 Modify::Delete(
                     name_to_cf(delete.get_cf()).unwrap(),
                     Key::from_encoded(delete.take_key()),
+                    ts,
                 )
             }
             raft_cmdpb::CmdType::Put => {
                 let put = req.mut_put();
+                let ts = if put.get_ts().len() != 0 {
+                    Some(TimeStamp::from_encoded(put.take_ts()))
+                } else {
+                    None
+                };
                 Modify::Put(
                     name_to_cf(put.get_cf()).unwrap(),
                     Key::from_encoded(put.take_key()),
+                    ts,
                     put.take_value(),
                 )
             }
@@ -316,7 +349,7 @@ pub trait Engine: Send + Clone + 'static {
     fn put_cf(&self, ctx: &Context, cf: CfName, key: Key, value: Value) -> Result<()> {
         self.write(
             ctx,
-            WriteData::from_modifies(vec![Modify::Put(cf, key, value)]),
+            WriteData::from_modifies(vec![Modify::Put(cf, key, None, value)]),
         )
     }
 
@@ -325,7 +358,10 @@ pub trait Engine: Send + Clone + 'static {
     }
 
     fn delete_cf(&self, ctx: &Context, cf: CfName, key: Key) -> Result<()> {
-        self.write(ctx, WriteData::from_modifies(vec![Modify::Delete(cf, key)]))
+        self.write(
+            ctx,
+            WriteData::from_modifies(vec![Modify::Delete(cf, key, None)]),
+        )
     }
 
     fn get_mvcc_properties_cf(
@@ -365,6 +401,12 @@ pub trait Snapshot: Sync + Send + Clone {
     /// in `opts`
     fn get_cf_opt(&self, opts: ReadOptions, cf: CfName, key: &Key) -> Result<Option<Value>>;
     fn iter(&self, cf: CfName, iter_opt: IterOptions) -> Result<Self::Iter>;
+    fn get_val_ts_cf_opt(
+        &self,
+        opts: ReadOptions,
+        cf: CfName,
+        key: &Key,
+    ) -> Result<Option<(Value, TimeStamp)>>;
     // The minimum key this snapshot can retrieve.
     #[inline]
     fn lower_bound(&self) -> Option<&[u8]> {
@@ -430,6 +472,7 @@ pub trait Iterator: Send {
 
     /// Only be called when `self.valid() == Ok(true)`.
     fn key(&self) -> &[u8];
+    fn timestamp(&self) -> Option<&[u8]>;
     /// Only be called when `self.valid() == Ok(true)`.
     fn value(&self) -> &[u8];
 }
@@ -609,22 +652,32 @@ pub fn write_modifies(kv_engine: &impl LocalEngine, modifies: Vec<Modify>) -> Re
     let mut wb = kv_engine.write_batch();
     for rev in modifies {
         let res = match rev {
-            Modify::Delete(cf, k) => {
-                if cf == CF_DEFAULT {
-                    trace!("RocksEngine: delete"; "key" => %k);
-                    wb.delete(k.as_encoded())
+            Modify::Delete(cf, k, t) => {
+                if let Some(ts) = t {
+                    trace!("RocksEngine: delete_cf_with_ts"; "key" => %k, "ts" => ts);
+                    wb.delete_cf_with_ts(cf, k.as_encoded(), &ts.into_encoded())
                 } else {
-                    trace!("RocksEngine: delete_cf"; "cf" => cf, "key" => %k);
-                    wb.delete_cf(cf, k.as_encoded())
+                    if cf == CF_DEFAULT {
+                        trace!("RocksEngine: delete"; "key" => %k);
+                        wb.delete(k.as_encoded())
+                    } else {
+                        trace!("RocksEngine: delete_cf"; "cf" => cf, "key" => %k);
+                        wb.delete_cf(cf, k.as_encoded())
+                    }
                 }
             }
-            Modify::Put(cf, k, v) => {
-                if cf == CF_DEFAULT {
-                    trace!("RocksEngine: put"; "key" => %k, "value" => escape(&v));
-                    wb.put(k.as_encoded(), &v)
+            Modify::Put(cf, k, t, v) => {
+                if let Some(ts) = t {
+                    trace!("RocksEngine: put_cf_with_ts"; "key" => %k, "ts" => ts, "value" => escape(&v));
+                    wb.put_cf_with_ts(cf, k.as_encoded(), &ts.into_encoded(), &v)
                 } else {
-                    trace!("RocksEngine: put_cf"; "cf" => cf, "key" => %k, "value" => escape(&v));
-                    wb.put_cf(cf, k.as_encoded(), &v)
+                    if cf == CF_DEFAULT {
+                        trace!("RocksEngine: put"; "key" => %k, "value" => escape(&v));
+                        wb.put(k.as_encoded(), &v)
+                    } else {
+                        trace!("RocksEngine: put_cf"; "cf" => cf, "key" => %k, "value" => escape(&v));
+                        wb.put_cf(cf, k.as_encoded(), &v)
+                    }
                 }
             }
             Modify::PessimisticLock(k, lock) => {
@@ -791,8 +844,8 @@ pub mod tests {
             .write(
                 &Context::default(),
                 WriteData::from_modifies(vec![
-                    Modify::Put(CF_DEFAULT, Key::from_raw(b"x"), b"1".to_vec()),
-                    Modify::Put(CF_DEFAULT, Key::from_raw(b"y"), b"2".to_vec()),
+                    Modify::Put(CF_DEFAULT, Key::from_raw(b"x"), None, b"1".to_vec()),
+                    Modify::Put(CF_DEFAULT, Key::from_raw(b"y"), None, b"2".to_vec()),
                 ]),
             )
             .unwrap();
@@ -803,8 +856,8 @@ pub mod tests {
             .write(
                 &Context::default(),
                 WriteData::from_modifies(vec![
-                    Modify::Delete(CF_DEFAULT, Key::from_raw(b"x")),
-                    Modify::Delete(CF_DEFAULT, Key::from_raw(b"y")),
+                    Modify::Delete(CF_DEFAULT, Key::from_raw(b"x"), None),
+                    Modify::Delete(CF_DEFAULT, Key::from_raw(b"y"), None),
                 ]),
             )
             .unwrap();
@@ -1159,10 +1212,11 @@ mod unit_tests {
     #[test]
     fn test_modifies_to_requests() {
         let modifies = vec![
-            Modify::Delete(CF_DEFAULT, Key::from_encoded_slice(b"k-del")),
+            Modify::Delete(CF_DEFAULT, Key::from_encoded_slice(b"k-del"), None),
             Modify::Put(
                 CF_WRITE,
                 Key::from_encoded_slice(b"k-put"),
+                None,
                 b"v-put".to_vec(),
             ),
             Modify::PessimisticLock(
@@ -1252,7 +1306,7 @@ mod unit_tests {
             .into_iter()
             .map(|m| match m {
                 Modify::PessimisticLock(k, lock) => {
-                    Modify::Put(CF_LOCK, k, lock.into_lock().to_bytes())
+                    Modify::Put(CF_LOCK, k, None, lock.into_lock().to_bytes())
                 }
                 _ => m,
             })

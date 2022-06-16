@@ -223,6 +223,7 @@ fn bench_async_write(b: &mut test::Bencher) {
             WriteData::from_modifies(vec![Modify::Delete(
                 CF_DEFAULT,
                 Key::from_encoded(b"fooo".to_vec()),
+                None,
             )]),
             on_finished,
         )

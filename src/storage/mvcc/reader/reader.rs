@@ -1,7 +1,9 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::mem::size_of;
+
 // #[PerformanceCriticalPath]
-use engine_traits::{CF_DEFAULT, CF_LOCK, CF_WRITE};
+use engine_traits::{ReadOptions, CF_DEFAULT, CF_LOCK, CF_WRITE};
 use kvproto::{
     errorpb::{self, EpochNotMatch, StaleCommand},
     kvrpcpb::Context,
@@ -273,32 +275,52 @@ impl<S: EngineSnapshot> MvccReader<S> {
     ///   leave the write_cursor at the first record which key is less or equal
     /// to the `ts` encoded version of `key`
     pub fn seek_write(&mut self, key: &Key, ts: TimeStamp) -> Result<Option<(TimeStamp, Write)>> {
-        // Get the cursor for write record
-        //
-        // When it switches to another key in prefix seek mode, creates a new cursor for
-        // it because the current position of the cursor is seldom around `key`.
-        if self.scan_mode.is_none() && self.current_key.as_ref().map_or(true, |k| k != key) {
-            self.current_key = Some(key.clone());
-            self.write_cursor.take();
+        if false {
+            // Get the cursor for write record
+            //
+            // When it switches to another key in prefix seek mode, creates a new cursor for
+            // it because the current position of the cursor is seldom around
+            // `key`.
+            if self.scan_mode.is_none() && self.current_key.as_ref().map_or(true, |k| k != key) {
+                self.current_key = Some(key.clone());
+                self.write_cursor.take();
+            }
+            self.create_write_cursor(false)?;
+            let cursor = self.write_cursor.as_mut().unwrap();
+            // find a `ts` encoded key which is less than the `ts` encoded version of the
+            // `key`
+            let found = cursor.near_seek(&key.clone().append_ts(ts), &mut self.statistics.write)?;
+            if !found {
+                return Ok(None);
+            }
+            let write_key = cursor.key(&mut self.statistics.write);
+            let commit_ts = Key::decode_ts_from(write_key)?;
+            // check whether the found written_key's "real key" part equals the `key` we
+            // want to find
+            if !Key::is_user_key_eq(write_key, key.as_encoded()) {
+                return Ok(None);
+            }
+
+            // parse out the write record
+            let write = WriteRef::parse(cursor.value(&mut self.statistics.write))?.to_owned();
+            Ok(Some((commit_ts, write)))
+        } else {
+            if self.scan_mode.is_none() && self.current_key.as_ref().map_or(true, |k| k != key) {
+                self.current_key = Some(key.clone());
+                self.write_cursor.take();
+            }
+            self.create_write_cursor(true)?;
+            let mut opts = ReadOptions::default();
+            opts.set_timestamp(ts);
+            let ret = self.snapshot.get_val_ts_cf_opt(opts, CF_WRITE, key)?;
+            if let Some((v, ts)) = ret {
+                self.statistics.write.flow_stats.read_bytes += v.len() + size_of::<TimeStamp>();
+                let write = WriteRef::parse(&v)?.to_owned();
+                Ok(Some((ts, write)))
+            } else {
+                Ok(None)
+            }
         }
-        self.create_write_cursor()?;
-        let cursor = self.write_cursor.as_mut().unwrap();
-        // find a `ts` encoded key which is less than the `ts` encoded version of the
-        // `key`
-        let found = cursor.near_seek(&key.clone().append_ts(ts), &mut self.statistics.write)?;
-        if !found {
-            return Ok(None);
-        }
-        let write_key = cursor.key(&mut self.statistics.write);
-        let commit_ts = Key::decode_ts_from(write_key)?;
-        // check whether the found written_key's "real key" part equals the `key` we
-        // want to find
-        if !Key::is_user_key_eq(write_key, key.as_encoded()) {
-            return Ok(None);
-        }
-        // parse out the write record
-        let write = WriteRef::parse(cursor.value(&mut self.statistics.write))?.to_owned();
-        Ok(Some((commit_ts, write)))
     }
 
     /// Gets the value of the specified key's latest version before specified
@@ -427,13 +449,14 @@ impl<S: EngineSnapshot> MvccReader<S> {
         Ok(())
     }
 
-    fn create_write_cursor(&mut self) -> Result<()> {
+    fn create_write_cursor(&mut self, uses_user_timestamp: bool) -> Result<()> {
         if self.write_cursor.is_none() {
             let cursor = CursorBuilder::new(&self.snapshot, CF_WRITE)
                 .fill_cache(self.fill_cache)
                 // Only use prefix seek in non-scan mode.
                 .prefix_seek(self.scan_mode.is_none())
                 .scan_mode(self.get_scan_mode(true))
+                .full_scan_over_user_timestamp(uses_user_timestamp)
                 .build()?;
             self.write_cursor = Some(cursor);
         }
@@ -454,17 +477,20 @@ impl<S: EngineSnapshot> MvccReader<S> {
     /// Return the first committed key for which `start_ts` equals to `ts`
     pub fn seek_ts(&mut self, ts: TimeStamp) -> Result<Option<Key>> {
         assert!(self.scan_mode.is_some());
-        self.create_write_cursor()?;
+        self.create_write_cursor(true)?;
 
         let cursor = self.write_cursor.as_mut().unwrap();
         let mut ok = cursor.seek_to_first(&mut self.statistics.write);
 
         while ok {
             if WriteRef::parse(cursor.value(&mut self.statistics.write))?.start_ts == ts {
-                return Ok(Some(
-                    Key::from_encoded(cursor.key(&mut self.statistics.write).to_vec())
-                        .truncate_ts()?,
-                ));
+                // return Ok(Some(
+                //     Key::from_encoded(cursor.key(&mut self.statistics.write).to_vec())
+                //         .truncate_ts()?,
+                // ));
+                return Ok(Some(Key::from_encoded(
+                    cursor.key(&mut self.statistics.write).to_vec(),
+                )));
             }
             ok = cursor.next(&mut self.statistics.write);
         }
@@ -525,28 +551,53 @@ impl<S: EngineSnapshot> MvccReader<S> {
         mut start: Option<Key>,
         limit: usize,
     ) -> Result<(Vec<Key>, Option<Key>)> {
-        let mut cursor = CursorBuilder::new(&self.snapshot, CF_WRITE)
-            .fill_cache(self.fill_cache)
-            .scan_mode(self.get_scan_mode(false))
-            .build()?;
-        let mut keys = vec![];
-        loop {
-            let ok = match start {
-                Some(ref x) => cursor.near_seek(x, &mut self.statistics.write)?,
-                None => cursor.seek_to_first(&mut self.statistics.write),
-            };
-            if !ok {
-                return Ok((keys, None));
+        if false {
+            let mut cursor = CursorBuilder::new(&self.snapshot, CF_WRITE)
+                .fill_cache(self.fill_cache)
+                .scan_mode(self.get_scan_mode(false))
+                .build()?;
+            let mut keys = vec![];
+            loop {
+                let ok = match start {
+                    Some(ref x) => cursor.near_seek(x, &mut self.statistics.write)?,
+                    None => cursor.seek_to_first(&mut self.statistics.write),
+                };
+                if !ok {
+                    return Ok((keys, None));
+                }
+                if keys.len() >= limit {
+                    self.statistics.write.processed_keys += keys.len();
+                    resource_metering::record_read_keys(keys.len() as u32);
+                    return Ok((keys, start));
+                }
+                let key = Key::from_encoded(cursor.key(&mut self.statistics.write).to_vec())
+                    .truncate_ts()?;
+                start = Some(key.clone().append_ts(TimeStamp::zero()));
+                keys.push(key);
             }
-            if keys.len() >= limit {
-                self.statistics.write.processed_keys += keys.len();
-                resource_metering::record_read_keys(keys.len() as u32);
-                return Ok((keys, start));
+        } else {
+            let mut cursor = CursorBuilder::new(&self.snapshot, CF_WRITE)
+                .fill_cache(self.fill_cache)
+                .scan_mode(self.get_scan_mode(false))
+                .build()?;
+            let mut keys = vec![];
+            loop {
+                let ok = match start {
+                    Some(ref x) => cursor.near_seek(x, &mut self.statistics.write)?,
+                    None => cursor.seek_to_first(&mut self.statistics.write),
+                };
+                if !ok {
+                    return Ok((keys, None));
+                }
+                if keys.len() >= limit {
+                    self.statistics.write.processed_keys += keys.len();
+                    resource_metering::record_read_keys(keys.len() as u32);
+                    return Ok((keys, start));
+                }
+                let key = Key::from_encoded(cursor.key(&mut self.statistics.write).to_vec());
+                start = Some(key.clone());
+                keys.push(key);
             }
-            let key =
-                Key::from_encoded(cursor.key(&mut self.statistics.write).to_vec()).truncate_ts()?;
-            start = Some(key.clone().append_ts(TimeStamp::zero()));
-            keys.push(key);
         }
     }
 
@@ -861,13 +912,21 @@ pub mod tests {
             let mut wb = db.write_batch();
             for rev in modifies {
                 match rev {
-                    Modify::Put(cf, k, v) => {
+                    Modify::Put(cf, k, t, v) => {
                         let k = keys::data_key(k.as_encoded());
-                        wb.put_cf(cf, &k, &v).unwrap();
+                        if let Some(ts) = t {
+                            wb.put_cf_with_ts(cf, &k, &ts.into_encoded(), &v).unwrap();
+                        } else {
+                            wb.put_cf(cf, &k, &v).unwrap();
+                        }
                     }
-                    Modify::Delete(cf, k) => {
+                    Modify::Delete(cf, k, t) => {
                         let k = keys::data_key(k.as_encoded());
-                        wb.delete_cf(cf, &k).unwrap();
+                        if let Some(ts) = t {
+                            wb.delete_cf_with_ts(cf, &k, &ts.into_encoded()).unwrap();
+                        } else {
+                            wb.delete_cf(cf, &k).unwrap();
+                        }
                     }
                     Modify::PessimisticLock(k, lock) => {
                         let k = keys::data_key(k.as_encoded());
@@ -1226,11 +1285,13 @@ pub mod tests {
             Modify::Put(
                 CF_WRITE,
                 Key::from_raw(k).append_ts(TimeStamp::new(3)),
+                None,
                 vec![b'R', 3],
             ),
             Modify::Put(
                 CF_WRITE,
                 Key::from_raw(k).append_ts(TimeStamp::new(7)),
+                None,
                 vec![b'R', 7],
             ),
         ]);
@@ -1640,6 +1701,7 @@ pub mod tests {
                 modifies: vec![Modify::Put(
                     CF_DEFAULT,
                     Key::from_raw(k).append_ts(TimeStamp::new(1)),
+                    None,
                     vec![],
                 )],
                 scan_mode: None,
@@ -1656,6 +1718,7 @@ pub mod tests {
                 modifies: vec![Modify::Put(
                     CF_DEFAULT,
                     Key::from_raw(k).append_ts(TimeStamp::new(2)),
+                    None,
                     long_value.to_vec(),
                 )],
                 scan_mode: Some(ScanMode::Forward),
@@ -1668,6 +1731,7 @@ pub mod tests {
                 modifies: vec![Modify::Put(
                     CF_WRITE,
                     Key::from_raw(k).append_ts(TimeStamp::new(1)),
+                    None,
                     Write::new(WriteType::Put, TimeStamp::new(1), None)
                         .as_ref()
                         .to_bytes(),
@@ -1682,6 +1746,7 @@ pub mod tests {
                 modifies: vec![Modify::Put(
                     CF_DEFAULT,
                     Key::from_raw(k).append_ts(TimeStamp::new(4)),
+                    None,
                     long_value.to_vec(),
                 )],
                 scan_mode: None,
@@ -1740,6 +1805,7 @@ pub mod tests {
                 modifies: vec![Modify::Delete(
                     CF_DEFAULT,
                     Key::from_raw(k).append_ts(TimeStamp::new(1)),
+                    None,
                 )],
                 key: Key::from_raw(k),
                 ts: TimeStamp::new(1),
@@ -1753,6 +1819,7 @@ pub mod tests {
                 modifies: vec![Modify::Put(
                     CF_WRITE,
                     Key::from_raw(k).append_ts(TimeStamp::new(2)),
+                    None,
                     Write::new(WriteType::Put, TimeStamp::new(2), None)
                         .as_ref()
                         .to_bytes(),
@@ -1770,6 +1837,7 @@ pub mod tests {
                     Modify::Put(
                         CF_WRITE,
                         Key::from_raw(k).append_ts(TimeStamp::new(4)),
+                        None,
                         Write::new(WriteType::Put, TimeStamp::new(4), None)
                             .as_ref()
                             .to_bytes(),
@@ -1777,6 +1845,7 @@ pub mod tests {
                     Modify::Put(
                         CF_DEFAULT,
                         Key::from_raw(k).append_ts(TimeStamp::new(4)),
+                        None,
                         long_value,
                     ),
                 ],

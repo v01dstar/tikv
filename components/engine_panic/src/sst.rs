@@ -65,6 +65,9 @@ impl Iterator for PanicSstReaderIterator {
     fn key(&self) -> &[u8] {
         panic!()
     }
+    fn timestamp(&self) -> Option<&[u8]> {
+        panic!()
+    }
     fn value(&self) -> &[u8] {
         panic!()
     }
@@ -83,7 +86,13 @@ impl SstWriter for PanicSstWriter {
     fn put(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
         panic!()
     }
+    fn put_with_ts(&mut self, key: &[u8], ts: &[u8], val: &[u8]) -> Result<()> {
+        panic!()
+    }
     fn delete(&mut self, key: &[u8]) -> Result<()> {
+        panic!()
+    }
+    fn delete_with_ts(&mut self, key: &[u8], ts: &[u8]) -> Result<()> {
         panic!()
     }
     fn file_size(&mut self) -> u64 {

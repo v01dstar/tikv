@@ -4,8 +4,8 @@
 use std::marker::PhantomData;
 
 use api_version::KvFormat;
-use engine_traits::{raw_ttl::ttl_current_ts, CfName, IterOptions, ReadOptions};
-use txn_types::{Key, Value};
+use engine_traits::{raw_ttl::ttl_current_ts, CfName, IterOptions, ReadOptions, CF_WRITE};
+use txn_types::{Key, TimeStamp, Value};
 
 use crate::storage::{
     kv::{Iterator, Result, Snapshot, RAW_VALUE_TOMBSTONE},
@@ -38,6 +38,19 @@ impl<S: Snapshot, F: KvFormat> RawEncodeSnapshot<S, F> {
         Ok(None)
     }
 
+    fn map_value_and_ts(
+        &self,
+        vt: Result<Option<(Value, TimeStamp)>>,
+    ) -> Result<Option<(Value, TimeStamp)>> {
+        if let Some((v, ts)) = vt? {
+            let raw_value = F::decode_raw_value_owned(v)?;
+            if raw_value.is_valid(self.current_ts) {
+                return Ok(Some((raw_value.user_value, ts)));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn get_key_ttl_cf(
         &self,
         cf: CfName,
@@ -46,16 +59,34 @@ impl<S: Snapshot, F: KvFormat> RawEncodeSnapshot<S, F> {
     ) -> Result<Option<u64>> {
         stats.data.flow_stats.read_keys = 1;
         stats.data.flow_stats.read_bytes = key.as_encoded().len();
-        if let Some(v) = self.snap.get_cf(cf, key)? {
-            stats.data.flow_stats.read_bytes += v.len();
-            let raw_value = F::decode_raw_value_owned(v)?;
-            return match raw_value.expire_ts {
-                Some(expire_ts) if expire_ts <= self.current_ts => Ok(None),
-                Some(expire_ts) => Ok(Some(expire_ts - self.current_ts)),
-                None => Ok(Some(0)),
-            };
+        if cf == CF_WRITE {
+            let key_clone = key.clone();
+            let user_timestamp = key_clone.decode_ts().unwrap();
+            let user_key = key_clone.truncate_ts().unwrap();
+            let mut opts = ReadOptions::default();
+            opts.set_timestamp(user_timestamp);
+            if let Some(v) = self.snap.get_cf_opt(opts, cf, &user_key)? {
+                stats.data.flow_stats.read_bytes += v.len();
+                let raw_value = F::decode_raw_value_owned(v)?;
+                return match raw_value.expire_ts {
+                    Some(expire_ts) if expire_ts <= self.current_ts => Ok(None),
+                    Some(expire_ts) => Ok(Some(expire_ts - self.current_ts)),
+                    None => Ok(Some(0)),
+                };
+            }
+            Ok(None)
+        } else {
+            if let Some(v) = self.snap.get_cf(cf, key)? {
+                stats.data.flow_stats.read_bytes += v.len();
+                let raw_value = F::decode_raw_value_owned(v)?;
+                return match raw_value.expire_ts {
+                    Some(expire_ts) if expire_ts <= self.current_ts => Ok(None),
+                    Some(expire_ts) => Ok(Some(expire_ts - self.current_ts)),
+                    None => Ok(Some(0)),
+                };
+            }
+            Ok(None)
         }
-        Ok(None)
     }
 }
 
@@ -73,6 +104,15 @@ impl<S: Snapshot, F: KvFormat> Snapshot for RawEncodeSnapshot<S, F> {
 
     fn get_cf_opt(&self, opts: ReadOptions, cf: CfName, key: &Key) -> Result<Option<Value>> {
         self.map_value(self.snap.get_cf_opt(opts, cf, key))
+    }
+
+    fn get_val_ts_cf_opt(
+        &self,
+        opts: ReadOptions,
+        cf: CfName,
+        key: &Key,
+    ) -> Result<Option<(Value, txn_types::TimeStamp)>> {
+        self.map_value_and_ts(self.snap.get_val_ts_cf_opt(opts, cf, key))
     }
 
     fn iter(&self, cf: CfName, iter_opt: IterOptions) -> Result<Self::Iter> {
@@ -187,6 +227,10 @@ impl<I: Iterator, F: KvFormat> Iterator for RawEncodeIterator<I, F> {
 
     fn key(&self) -> &[u8] {
         self.inner.key()
+    }
+
+    fn timestamp(&self) -> Option<&[u8]> {
+        self.inner.timestamp()
     }
 
     fn value(&self) -> &[u8] {

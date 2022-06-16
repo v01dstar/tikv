@@ -201,13 +201,20 @@ fn group_row_changes(requests: Vec<Request>) -> HashMap<Key, RowChange> {
                 let mut put = req.take_put();
                 let key = Key::from_encoded(put.take_key());
                 let value = put.take_value();
+                let ts = put.take_ts();
                 match put.cf.as_str() {
                     CF_WRITE => {
-                        if let Ok(ts) = key.decode_ts() {
-                            let key = key.truncate_ts().unwrap();
+                        if ts.len() > 0 {
                             let mut row = changes.entry(key).or_default();
                             assert!(row.write.is_none());
-                            row.write = Some(KeyOp::Put(Some(ts), value));
+                            row.write = Some(KeyOp::Put(Some(TimeStamp::from_encoded(ts)), value));
+                        } else {
+                            if let Ok(ts) = key.decode_ts() {
+                                let key = key.truncate_ts().unwrap();
+                                let mut row = changes.entry(key).or_default();
+                                assert!(row.write.is_none());
+                                row.write = Some(KeyOp::Put(Some(ts), value));
+                            }
                         }
                     }
                     CF_LOCK => {
@@ -307,7 +314,7 @@ mod tests {
         let rocks_engine = TestEngineBuilder::new().build().unwrap();
         let engine = MockEngineBuilder::from_rocks_engine(rocks_engine).build();
 
-        let reqs = vec![Modify::Put("default", Key::from_raw(b"k1"), b"v1".to_vec()).into()];
+        let reqs = vec![Modify::Put("default", Key::from_raw(b"k1"), None, b"v1".to_vec()).into()];
         assert!(ChangeLog::encode_rows(group_row_changes(reqs), false).is_empty());
 
         must_prewrite_put(&engine, b"k1", b"v1", b"k1", 1);

@@ -334,11 +334,11 @@ where
     fn modify_on_kv_engine(&self, mut modifies: Vec<Modify>) -> kv::Result<()> {
         for modify in &mut modifies {
             match modify {
-                Modify::Delete(_, ref mut key) => {
+                Modify::Delete(_, ref mut key, _) => {
                     let bytes = keys::data_key(key.as_encoded());
                     *key = Key::from_encoded(bytes);
                 }
-                Modify::Put(_, ref mut key, _) => {
+                Modify::Put(_, ref mut key, _, _) => {
                     let bytes = keys::data_key(key.as_encoded());
                     *key = Key::from_encoded(bytes);
                 }

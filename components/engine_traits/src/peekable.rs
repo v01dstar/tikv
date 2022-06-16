@@ -30,6 +30,13 @@ pub trait Peekable {
         key: &[u8],
     ) -> Result<Option<Self::DbVector>>;
 
+    fn get_value_ts_cf_opt(
+        &self,
+        opts: &ReadOptions,
+        cf: &str,
+        key: &[u8],
+    ) -> Result<Option<(Self::DbVector, Vec<u8>)>>;
+
     /// Read a value for a key.
     ///
     /// Uses the default options and column family.

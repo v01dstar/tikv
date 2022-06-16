@@ -14,7 +14,7 @@ use std::{
 use engine_panic::PanicEngine;
 use engine_traits::{CfName, IterOptions, ReadOptions, CF_DEFAULT, CF_LOCK, CF_WRITE};
 use kvproto::kvrpcpb::Context;
-use txn_types::{Key, Value};
+use txn_types::{Key, TimeStamp, Value};
 
 use super::SnapContext;
 use crate::{
@@ -224,6 +224,10 @@ impl Iterator for BTreeEngineIterator {
         self.cur_key.as_ref().unwrap().as_encoded()
     }
 
+    fn timestamp(&self) -> Option<&[u8]> {
+        None
+    }
+
     fn value(&self) -> &[u8] {
         assert!(self.valid().unwrap());
         self.cur_value.as_ref().unwrap().as_slice()
@@ -248,6 +252,15 @@ impl Snapshot for BTreeEngineSnapshot {
     }
     fn get_cf_opt(&self, _: ReadOptions, cf: CfName, key: &Key) -> EngineResult<Option<Value>> {
         self.get_cf(cf, key)
+    }
+    fn get_val_ts_cf_opt(
+        &self,
+        opts: ReadOptions,
+        cf: CfName,
+        key: &Key,
+    ) -> EngineResult<Option<(Value, TimeStamp)>> {
+        self.get_cf_opt(opts, cf, key)
+            .map(|v| v.map(|v| (v, TimeStamp::zero())))
     }
     #[inline]
     fn iter(&self, cf: CfName, iter_opt: IterOptions) -> EngineResult<Self::Iter> {
@@ -275,11 +288,17 @@ impl BTreeEngineSnapshot {
 fn write_modifies(engine: &BTreeEngine, modifies: Vec<Modify>) -> EngineResult<()> {
     for rev in modifies {
         match rev {
-            Modify::Delete(cf, k) => {
+            Modify::Delete(cf, k, t) => {
+                if t.is_some() {
+                    panic!("Not supported");
+                }
                 let cf_tree = engine.get_cf(cf);
                 cf_tree.write().unwrap().remove(&k);
             }
-            Modify::Put(cf, k, v) => {
+            Modify::Put(cf, k, t, v) => {
+                if t.is_some() {
+                    panic!("Not supported");
+                }
                 let cf_tree = engine.get_cf(cf);
                 cf_tree.write().unwrap().insert(k, v);
             }

@@ -261,7 +261,7 @@ impl<T: Simulator> Cluster<T> {
         // Try recover from last shutdown.
         let node_ids: Vec<u64> = self.engines.iter().map(|(&id, _)| id).collect();
         for node_id in node_ids {
-            self.run_node(node_id)?;
+            self.run_node(node_id).unwrap();
         }
 
         // Try start new nodes.
@@ -357,7 +357,7 @@ impl<T: Simulator> Cluster<T> {
         // FIXME: rocksdb event listeners may not work, because we change the router.
         self.sim
             .wl()
-            .run_node(node_id, cfg, engines, store_meta, key_mgr, router, system)?;
+            .run_node(node_id, cfg, engines, store_meta, key_mgr, router, system).unwrap();
         debug!("node {} started", node_id);
         Ok(())
     }

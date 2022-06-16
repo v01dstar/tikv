@@ -277,7 +277,7 @@ impl<S: Snapshot> Store for SnapshotStore<S> {
     type Scanner = MvccScanner<S>;
 
     fn get(&self, key: &Key, statistics: &mut Statistics) -> Result<Option<Value>> {
-        let mut point_getter = PointGetterBuilder::new(self.snapshot.clone(), self.start_ts)
+        let mut point_getter = PointGetterBuilder::new(self.snapshot.clone(), self.start_ts, true)
             .fill_cache(self.fill_cache)
             .isolation_level(self.isolation_level)
             .bypass_locks(self.bypass_locks.clone())
@@ -291,7 +291,7 @@ impl<S: Snapshot> Store for SnapshotStore<S> {
     fn incremental_get(&mut self, key: &Key) -> Result<Option<Value>> {
         if self.point_getter_cache.is_none() {
             self.point_getter_cache = Some(
-                PointGetterBuilder::new(self.snapshot.clone(), self.start_ts)
+                PointGetterBuilder::new(self.snapshot.clone(), self.start_ts, true)
                     .fill_cache(self.fill_cache)
                     .isolation_level(self.isolation_level)
                     .bypass_locks(self.bypass_locks.clone())
@@ -329,7 +329,7 @@ impl<S: Snapshot> Store for SnapshotStore<S> {
         keys: &[Key],
         statistics: &mut Vec<Statistics>,
     ) -> Result<Vec<Result<Option<Value>>>> {
-        let mut point_getter = PointGetterBuilder::new(self.snapshot.clone(), self.start_ts)
+        let mut point_getter = PointGetterBuilder::new(self.snapshot.clone(), self.start_ts, true)
             .fill_cache(self.fill_cache)
             .isolation_level(self.isolation_level)
             .bypass_locks(self.bypass_locks.clone())
@@ -791,6 +791,9 @@ mod tests {
         fn key(&self) -> &[u8] {
             b""
         }
+        fn timestamp(&self) -> Option<&[u8]> {
+            None
+        }
         fn value(&self) -> &[u8] {
             b""
         }
@@ -813,6 +816,14 @@ mod tests {
             Ok(None)
         }
         fn get_cf_opt(&self, _: ReadOptions, _: CfName, _: &Key) -> EngineResult<Option<Value>> {
+            Ok(None)
+        }
+        fn get_val_ts_cf_opt(
+            &self,
+            _: ReadOptions,
+            _: CfName,
+            _: &Key,
+        ) -> EngineResult<Option<(Value, TimeStamp)>> {
             Ok(None)
         }
         fn iter(&self, _: CfName, _: IterOptions) -> EngineResult<Self::Iter> {

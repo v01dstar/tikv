@@ -145,7 +145,6 @@ pub fn prewrite<S: Snapshot>(
     } else {
         OldValue::Unspecified
     };
-
     let final_min_commit_ts = mutation.write_lock(lock_status, txn)?;
 
     fail_point!("after_prewrite_one_key");

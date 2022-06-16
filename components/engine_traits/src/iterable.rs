@@ -28,6 +28,7 @@
 //! - [RocksDB wiki on iterators](https://github.com/facebook/rocksdb/wiki/Iterator)
 
 use tikv_util::keybuilder::KeyBuilder;
+use txn_types::TimeStamp;
 
 use crate::*;
 
@@ -105,6 +106,8 @@ pub trait Iterator: Send {
     /// If the iterator is invalid, iterator may panic or aborted.
     fn value(&self) -> &[u8];
 
+    fn timestamp(&self) -> Option<&[u8]>;
+
     /// Returns `true` if the iterator points to a `key`/`value` pair.
     fn valid(&self) -> Result<bool>;
 }
@@ -138,6 +141,28 @@ pub trait Iterable {
         scan_impl(self.iterator_opt(cf, iter_opt)?, start_key, f)
     }
 
+    fn scan_cf_with_ts<F>(
+        &self,
+        cf: &str,
+        start_key: &[u8],
+        end_key: &[u8],
+        fill_cache: bool,
+        f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8], &[u8]) -> Result<bool>,
+    {
+        let start = KeyBuilder::from_slice(start_key, DATA_KEY_PREFIX_LEN, 0);
+        let end =
+            (!end_key.is_empty()).then(|| KeyBuilder::from_slice(end_key, DATA_KEY_PREFIX_LEN, 0));
+        let mut iter_opt = IterOptions::new(Some(start), end, fill_cache);
+        if cf == CF_WRITE {
+            iter_opt.set_timestamp(TimeStamp::max());
+            iter_opt.set_iter_start_ts(TimeStamp::zero());
+        }
+        scan_impl_with_ts(self.iterator_opt(cf, iter_opt)?, start_key, f)
+    }
+
     // Seek the first key >= given key, if not found, return None.
     fn seek(&self, cf: &str, key: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         let mut iter = self.iterator(cf)?;
@@ -156,6 +181,18 @@ where
     let mut remained = it.seek(start_key)?;
     while remained {
         remained = f(it.key(), it.value())? && it.next()?;
+    }
+    Ok(())
+}
+
+fn scan_impl_with_ts<Iter, F>(mut it: Iter, start_key: &[u8], mut f: F) -> Result<()>
+where
+    Iter: Iterator,
+    F: FnMut(&[u8], &[u8], &[u8]) -> Result<bool>,
+{
+    let mut remained = it.seek(start_key)?;
+    while remained {
+        remained = f(it.key(), it.timestamp().unwrap(), it.value())? && it.next()?;
     }
     Ok(())
 }

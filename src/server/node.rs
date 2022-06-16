@@ -168,7 +168,7 @@ where
         if store_id == INVALID_ID {
             store_id = self.alloc_id()?;
             debug!("alloc store id"; "store_id" => store_id);
-            store::bootstrap_store(&engines, self.cluster_id, store_id)?;
+            store::bootstrap_store(&engines, self.cluster_id, store_id).unwrap();
             fail_point!("node_after_bootstrap_store", |_| Err(box_err!(
                 "injected error: node_after_bootstrap_store"
             )));
@@ -204,7 +204,10 @@ where
             let mut meta = store_meta.lock().unwrap();
             meta.store_id = Some(store_id);
         }
-        if let Some(first_region) = self.check_or_prepare_bootstrap_cluster(&engines, store_id)? {
+        if let Some(first_region) = self
+            .check_or_prepare_bootstrap_cluster(&engines, store_id)
+            .unwrap()
+        {
             info!("trying to bootstrap cluster"; "store_id" => store_id, "region" => ?first_region);
             // cluster is not bootstrapped, and we choose first store to bootstrap
             fail_point!("node_after_prepare_bootstrap_cluster", |_| Err(box_err!(
@@ -231,7 +234,8 @@ where
             auto_split_controller,
             concurrency_manager,
             collector_reg_handle,
-        )?;
+        )
+        .unwrap();
 
         Ok(())
     }
@@ -261,7 +265,10 @@ where
     // check store, return store id for the engine.
     // If the store is not bootstrapped, use INVALID_ID.
     fn check_store(&self, engines: &Engines<EK, ER>) -> Result<u64> {
-        let res = engines.kv.get_msg::<StoreIdent>(keys::STORE_IDENT_KEY)?;
+        let res = engines
+            .kv
+            .get_msg::<StoreIdent>(keys::STORE_IDENT_KEY)
+            .unwrap();
         if res.is_none() {
             return Ok(INVALID_ID);
         }

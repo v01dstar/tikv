@@ -218,7 +218,7 @@ fn test_redundant_conf_change_by_snapshot() {
     let mut cluster = new_node_cluster(0, 4);
     cluster.cfg.raft_store.raft_log_gc_count_limit = Some(5);
     cluster.cfg.raft_store.merge_max_log_gap = 4;
-    cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::millis(20);
+    cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::millis(1000);
 
     let pd_client = Arc::clone(&cluster.pd_client);
     pd_client.disable_default_operator();
@@ -253,6 +253,7 @@ fn test_redundant_conf_change_by_snapshot() {
     // Use a filter to capture messages sent from 3 to 4.
     let (tx, rx) = mpsc::sync_channel(128);
     let cb = Arc::new(move |msg: &RaftMessage| {
+        info!("send request vote"; "to" => msg.get_message().get_to());
         if msg.get_message().get_to() == 4 {
             let _ = tx.send(());
         }

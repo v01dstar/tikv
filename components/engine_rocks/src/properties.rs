@@ -8,7 +8,7 @@ use std::{
     u64,
 };
 
-use engine_traits::{MvccProperties, Range};
+use engine_traits::{MvccProperties, Range, CF_WRITE};
 use rocksdb::{
     DBEntryType, TablePropertiesCollector, TablePropertiesCollectorFactory, TitanBlobIndex,
     UserCollectedProperties,
@@ -20,7 +20,7 @@ use tikv_util::{
     },
     info,
 };
-use txn_types::{Key, Write, WriteType};
+use txn_types::{Key, TimeStamp, Write, WriteType};
 
 use crate::{
     decode_properties::{DecodeProperties, IndexHandle, IndexHandles},
@@ -509,10 +509,22 @@ pub fn get_range_entries_and_versions(
     start: &[u8],
     end: &[u8],
 ) -> Option<(u64, u64)> {
-    let range = Range::new(start, end);
-    let collection = match engine.get_properties_of_tables_in_range(cf, &[range]) {
-        Ok(v) => v,
-        Err(_) => return None,
+    let collection = if cf == CF_WRITE {
+        let mut ts_encoded_start = start.to_vec();
+        ts_encoded_start.extend(TimeStamp::max().into_encoded().iter());
+        let mut ts_encoded_end = end.to_vec();
+        ts_encoded_end.extend(TimeStamp::max().into_encoded().iter());
+        let range = Range::new(&ts_encoded_start, &ts_encoded_end);
+        match engine.get_properties_of_tables_in_range(cf, &[range]) {
+            Ok(v) => v,
+            Err(_) => return None,
+        }
+    } else {
+        let range = Range::new(start, end);
+        match engine.get_properties_of_tables_in_range(cf, &[range]) {
+            Ok(v) => v,
+            Err(_) => return None,
+        }
     };
 
     if collection.is_empty() {

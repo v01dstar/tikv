@@ -73,7 +73,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for RawCompareAndSwap {
                     ApiVersion::API => API::encode_raw_value_owned(raw_value),
                 }
             );
-            let m = Modify::Put(cf, key, encoded_raw_value);
+            let m = Modify::Put(cf, key, None, encoded_raw_value);
             data.push(m);
             ProcessResult::RawCompareAndSwapRes {
                 previous_value: old_value,

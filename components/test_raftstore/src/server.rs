@@ -401,7 +401,7 @@ impl ServerCluster {
             res_tag_factory.clone(),
             quota_limiter.clone(),
             self.pd_client.feature_gate().clone(),
-        )?;
+        ).unwrap();
         self.storages.insert(node_id, raft_engine);
 
         ReplicaReadLockChecker::new(concurrency_manager.clone()).register(&mut coprocessor_host);
@@ -494,7 +494,7 @@ impl ServerCluster {
             bg_worker.clone(),
             Some(health_service.clone()),
         );
-        node.try_bootstrap_store(engines.clone())?;
+        node.try_bootstrap_store(engines.clone()).unwrap();
         let node_id = node.id();
 
         for _ in 0..100 {
@@ -575,7 +575,7 @@ impl ServerCluster {
             auto_split_controller,
             concurrency_manager.clone(),
             collector_reg_handle,
-        )?;
+        ).unwrap();
         assert!(node_id == 0 || node_id == node.id());
         let node_id = node.id();
         if let Some(tmp) = tmp {

@@ -326,13 +326,24 @@ impl<S: Snapshot> ScannerConfig<S> {
         } else {
             (None, None)
         };
-        let cursor = CursorBuilder::new(&self.snapshot, cf)
-            .range(lower, upper)
-            .fill_cache(self.fill_cache)
-            .scan_mode(scan_mode)
-            .hint_min_ts(hint_min_ts)
-            .hint_max_ts(hint_max_ts)
-            .build()?;
+        let cursor = if cf == CF_WRITE {
+            CursorBuilder::new(&self.snapshot, cf)
+                .range(lower, upper)
+                .fill_cache(self.fill_cache)
+                .scan_mode(scan_mode)
+                .hint_min_ts(hint_min_ts)
+                .hint_max_ts(hint_max_ts)
+                .full_scan_over_user_timestamp(true)
+                .build()?
+        } else {
+            CursorBuilder::new(&self.snapshot, cf)
+                .range(lower, upper)
+                .fill_cache(self.fill_cache)
+                .scan_mode(scan_mode)
+                .hint_min_ts(hint_min_ts)
+                .hint_max_ts(hint_max_ts)
+                .build()?
+        };
         Ok(cursor)
     }
 }
@@ -452,11 +463,13 @@ where
     I: Iterator,
 {
     let mut ret = None;
+    // while write_cursor.valid()?
+    //     && Key::is_user_key_eq(
+    //         write_cursor.key(&mut statistics.write),
+    //         user_key.as_encoded(),
+    //     )
     while write_cursor.valid()?
-        && Key::is_user_key_eq(
-            write_cursor.key(&mut statistics.write),
-            user_key.as_encoded(),
-        )
+        && write_cursor.key(&mut statistics.write) == user_key.as_encoded().as_slice()
     {
         let write_ref = WriteRef::parse(write_cursor.value(&mut statistics.write))?;
         if !write_ref.check_gc_fence_as_latest_version(gc_fence_limit) {
@@ -466,7 +479,12 @@ where
             WriteType::Put | WriteType::Delete => {
                 assert_ge!(
                     after_ts,
-                    Key::decode_ts_from(write_cursor.key(&mut statistics.write))?
+                    TimeStamp::from_encoded(
+                        write_cursor
+                            .timestamp(&mut statistics.write)
+                            .unwrap()
+                            .to_vec()
+                    ),
                 );
                 ret = Some(write_ref.to_owned());
                 break;

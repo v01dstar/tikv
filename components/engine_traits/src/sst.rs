@@ -35,10 +35,12 @@ pub trait SstWriter: Send {
     /// Add key, value to currently opened file
     /// REQUIRES: key is after any previously added key according to comparator.
     fn put(&mut self, key: &[u8], val: &[u8]) -> Result<()>;
+    fn put_with_ts(&mut self, key: &[u8], ts: &[u8], val: &[u8]) -> Result<()>;
 
     /// Add a deletion key to currently opened file
     /// REQUIRES: key is after any previously added key according to comparator.
     fn delete(&mut self, key: &[u8]) -> Result<()>;
+    fn delete_with_ts(&mut self, key: &[u8], ts: &[u8]) -> Result<()>;
 
     /// Return the current file size.
     fn file_size(&mut self) -> u64;

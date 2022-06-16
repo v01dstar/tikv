@@ -1,4 +1,4 @@
-// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
+// Copyright 2016 T&&&&&iKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
     cmp::Ordering,
@@ -16,7 +16,7 @@ use kvproto::{
 };
 use online_config::{ConfigChange, OnlineConfig};
 use tikv_util::{box_err, debug, error, info, keybuilder::KeyBuilder, warn, worker::Runnable};
-use txn_types::Key;
+use txn_types::{Key, TimeStamp};
 
 use super::metrics::*;
 #[cfg(any(test, feature = "testexport"))]
@@ -93,11 +93,14 @@ where
         let mut iters = Vec::with_capacity(cfs.len());
         let mut heap = BinaryHeap::with_capacity(cfs.len());
         for (pos, cf) in cfs.iter().enumerate() {
-            let iter_opt = IterOptions::new(
+            let mut iter_opt = IterOptions::new(
                 Some(KeyBuilder::from_slice(start_key, 0, 0)),
                 Some(KeyBuilder::from_slice(end_key, 0, 0)),
                 fill_cache,
             );
+            if *cf == CF_WRITE {
+                iter_opt.set_timestamp(TimeStamp::max());
+            }
             let mut iter = db.iterator_opt(cf, iter_opt)?;
             let found: Result<bool> = iter.seek(start_key).map_err(|e| box_err!(e));
             if found? {

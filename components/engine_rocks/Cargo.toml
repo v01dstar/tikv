@@ -59,6 +59,9 @@ git = "https://github.com/tikv/rust-rocksdb.git"
 package = "rocksdb"
 features = ["encryption"]
 
+[patch.'https://github.com/tikv/rust-rocksdb']
+rocksdb = {git = "https://github.com/v01dstar/rust-rocksdb", branch="user_timestamp"}
+
 [dev-dependencies]
 rand = "0.8"
 toml = "0.5"

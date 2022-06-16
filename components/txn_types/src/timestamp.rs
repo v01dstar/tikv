@@ -1,6 +1,7 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
+    convert::TryInto,
     fmt,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -83,6 +84,18 @@ impl TimeStamp {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64
+    }
+
+    #[inline]
+    pub fn from_encoded(encoded_ts: Vec<u8>) -> Self {
+        TimeStamp(u64::from_be_bytes(encoded_ts.try_into().unwrap_or_else(
+            |v: Vec<u8>| panic!("Expected a Vec of length {} but it was {}", 8, v.len()),
+        )))
+    }
+
+    #[inline]
+    pub fn into_encoded(self) -> Vec<u8> {
+        self.0.to_be_bytes().to_vec()
     }
 }
 

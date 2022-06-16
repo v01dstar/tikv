@@ -425,6 +425,8 @@ where
         info!(
             "apply new data";
             "region_id" => region_id,
+            "term" => term,
+            "idx" => idx,
             "time_takes" => ?timer.saturating_elapsed(),
         );
         Ok(())

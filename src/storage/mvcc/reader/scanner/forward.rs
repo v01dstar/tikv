@@ -75,33 +75,52 @@ impl<S: Snapshot> Cursors<S> {
         current_user_key: &Key,
         statistics: &mut Statistics,
     ) -> Result<()> {
-        for i in 0..SEEK_BOUND {
-            if i > 0 {
-                self.write.next(&mut statistics.write);
-            }
-            if !self.write.valid()? {
-                // Key space ended. We are done here.
-                return Ok(());
-            }
-            {
-                let current_key = self.write.key(&mut statistics.write);
-                if !Key::is_user_key_eq(current_key, current_user_key.as_encoded().as_slice()) {
-                    // Found another user key. We are done here.
+        if false {
+            for i in 0..SEEK_BOUND {
+                if i > 0 {
+                    self.write.next(&mut statistics.write);
+                }
+                if !self.write.valid()? {
+                    // Key space ended. We are done here.
                     return Ok(());
                 }
+                {
+                    let current_key = self.write.key(&mut statistics.write);
+                    if !Key::is_user_key_eq(current_key, current_user_key.as_encoded().as_slice()) {
+                        // Found another user key. We are done here.
+                        return Ok(());
+                    }
+                }
+            }
+
+            // We have not found another user key for now, so we directly `seek()`.
+            // After that, we must pointing to another key, or out of bound.
+            // `current_user_key` must have reserved space here, so its clone has reserved
+            // space too. So no reallocation happens in `append_ts`.
+            self.write.internal_seek(
+                // &current_user_key.clone().append_ts(TimeStamp::zero()),
+                &current_user_key.clone(),
+                &mut statistics.write,
+            )?;
+            Ok(())
+        } else {
+            loop {
+                if !self.write.valid()? {
+                    // Key space ended. We are done here.
+                    return Ok(());
+                }
+                {
+                    let current_key = self.write.key(&mut statistics.write);
+                    // if !Key::is_user_key_eq(current_key,
+                    // current_user_key.as_encoded().as_slice()) {
+                    if current_key != current_user_key.as_encoded().as_slice() {
+                        // Found another user key. We are done here.
+                        return Ok(());
+                    }
+                }
+                self.write.next(&mut statistics.write);
             }
         }
-
-        // We have not found another user key for now, so we directly `seek()`.
-        // After that, we must pointing to another key, or out of bound.
-        // `current_user_key` must have reserved space here, so its clone has reserved
-        // space too. So no reallocation happens in `append_ts`.
-        self.write.internal_seek(
-            &current_user_key.clone().append_ts(TimeStamp::zero()),
-            &mut statistics.write,
-        )?;
-
-        Ok(())
     }
 
     /// Create the default cursor if it doesn't exist.
@@ -236,15 +255,14 @@ impl<S: Snapshot, P: ScanPolicy<S>> ForwardScanner<S, P> {
                     (Some(k), None) => {
                         // Write cursor yields something but lock cursor yields `None`:
                         // We need to further step write cursor to our desired version
-                        (Key::truncate_ts_for(k)?, true, false)
+                        (k, true, false)
                     }
                     (Some(wk), Some(lk)) => {
-                        let write_user_key = Key::truncate_ts_for(wk)?;
-                        match write_user_key.cmp(lk) {
+                        match wk.cmp(lk) {
                             Ordering::Less => {
                                 // Write cursor user key < lock cursor, it means the lock of the
                                 // current key that write cursor is pointing to does not exist.
-                                (write_user_key, true, false)
+                                (wk, true, false)
                             }
                             Ordering::Greater => {
                                 // Write cursor user key > lock cursor, it means we got a lock of a
@@ -310,31 +328,89 @@ impl<S: Snapshot, P: ScanPolicy<S>> ForwardScanner<S, P> {
     fn move_write_cursor_to_ts(&mut self, user_key: &Key) -> Result<bool> {
         assert!(self.cursors.write.valid()?);
 
-        // Try to iterate to `${user_key}_${ts}`. We first `next()` for a few times,
-        // and if we have not reached where we want, we use `seek()`.
+        if false {
+            // Try to iterate to `${user_key}_${ts}`. We first `next()` for a few times,
+            // and if we have not reached where we want, we use `seek()`.
 
-        // Whether we have *not* reached where we want by `next()`.
-        let mut needs_seek = true;
+            // Whether we have *not* reached where we want by `next()`.
+            let mut needs_seek = true;
 
-        for i in 0..SEEK_BOUND {
-            if i > 0 {
-                self.cursors.write.next(&mut self.statistics.write);
+            for i in 0..SEEK_BOUND {
+                if i > 0 {
+                    self.cursors.write.next(&mut self.statistics.write);
+                    if !self.cursors.write.valid()? {
+                        // Key space ended.
+                        return Ok(false);
+                    }
+                }
+                {
+                    let current_key = self.cursors.write.key(&mut self.statistics.write);
+                    if !Key::is_user_key_eq(current_key, user_key.as_encoded().as_slice()) {
+                        // Meet another key.
+                        return Ok(false);
+                    }
+                    let key_commit_ts = Key::decode_ts_from(current_key)?;
+                    if key_commit_ts <= self.cfg.ts {
+                        // Founded, don't need to seek again.
+                        needs_seek = false;
+                        break;
+                    } else if self.met_newer_ts_data == NewerTsCheckState::NotMetYet {
+                        self.met_newer_ts_data = NewerTsCheckState::Met;
+                    }
+
+                    // Report error if there's a more recent version if the isolation level is
+                    // RcCheckTs.
+                    if self.cfg.isolation_level == IsolationLevel::RcCheckTs {
+                        // TODO: the more write recent version with `LOCK` or `ROLLBACK` write type
+                        //       could be skipped.
+                        return Err(WriteConflict {
+                            start_ts: self.cfg.ts,
+                            conflict_start_ts: Default::default(),
+                            conflict_commit_ts: key_commit_ts,
+                            key: current_key.into(),
+                            primary: vec![],
+                        }
+                        .into());
+                    }
+                }
+            }
+            // If we have not found `${user_key}_${ts}` in a few `next()`, directly
+            // `seek()`.
+            if needs_seek {
+                // `user_key` must have reserved space here, so its clone has reserved space
+                // too. So no reallocation happens in `append_ts`.
+                self.cursors.write.seek(
+                    &user_key.clone().append_ts(self.cfg.ts),
+                    &mut self.statistics.write,
+                )?;
                 if !self.cursors.write.valid()? {
                     // Key space ended.
                     return Ok(false);
                 }
-            }
-            {
                 let current_key = self.cursors.write.key(&mut self.statistics.write);
                 if !Key::is_user_key_eq(current_key, user_key.as_encoded().as_slice()) {
                     // Meet another key.
                     return Ok(false);
                 }
-                let key_commit_ts = Key::decode_ts_from(current_key)?;
+            }
+            Ok(true)
+        } else {
+            loop {
+                let current_key = self.cursors.write.key(&mut self.statistics.write);
+                if current_key != user_key.as_encoded().as_slice() {
+                    // Meet another key.
+                    return Ok(false);
+                }
+                let key_commit_ts = TimeStamp::from_encoded(
+                    self.cursors
+                        .write
+                        .timestamp(&mut self.statistics.write)
+                        .unwrap()
+                        .to_vec(),
+                );
                 if key_commit_ts <= self.cfg.ts {
                     // Founded, don't need to seek again.
-                    needs_seek = false;
-                    break;
+                    return Ok(true);
                 } else if self.met_newer_ts_data == NewerTsCheckState::NotMetYet {
                     self.met_newer_ts_data = NewerTsCheckState::Met;
                 }
@@ -353,28 +429,13 @@ impl<S: Snapshot, P: ScanPolicy<S>> ForwardScanner<S, P> {
                     }
                     .into());
                 }
+                self.cursors.write.next(&mut self.statistics.write);
+                if !self.cursors.write.valid()? {
+                    // Key space ended.
+                    return Ok(false);
+                }
             }
         }
-        // If we have not found `${user_key}_${ts}` in a few `next()`, directly
-        // `seek()`.
-        if needs_seek {
-            // `user_key` must have reserved space here, so its clone has reserved space
-            // too. So no reallocation happens in `append_ts`.
-            self.cursors.write.seek(
-                &user_key.clone().append_ts(self.cfg.ts),
-                &mut self.statistics.write,
-            )?;
-            if !self.cursors.write.valid()? {
-                // Key space ended.
-                return Ok(false);
-            }
-            let current_key = self.cursors.write.key(&mut self.statistics.write);
-            if !Key::is_user_key_eq(current_key, user_key.as_encoded().as_slice()) {
-                // Meet another key.
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 }
 
@@ -482,7 +543,9 @@ impl<S: Snapshot> ScanPolicy<S> for LatestKvPolicy {
                 return Ok(HandleRes::Skip(current_user_key));
             }
             let current_key = cursors.write.key(&mut statistics.write);
-            if !Key::is_user_key_eq(current_key, current_user_key.as_encoded().as_slice()) {
+            // if !Key::is_user_key_eq(current_key,
+            // current_user_key.as_encoded().as_slice()) {
+            if current_key != current_user_key.as_encoded().as_slice() {
                 // Meet another key. Needn't move write cursor to next key.
                 return Ok(HandleRes::Skip(current_user_key));
             }
@@ -543,7 +606,15 @@ impl<S: Snapshot> ScanPolicy<S> for LatestEntryPolicy {
         // up.
         let mut write_key = cursors.write.key(&mut statistics.write);
         let entry: Option<TxnEntry> = loop {
-            if Key::decode_ts_from(write_key)? <= self.after_ts {
+            // if Key::decode_ts_from(write_key)? <= self.after_ts {
+            if TimeStamp::from_encoded(
+                cursors
+                    .write
+                    .timestamp(&mut statistics.write)
+                    .unwrap()
+                    .to_vec(),
+            ) <= self.after_ts
+            {
                 // There are no newer records of this key since `after_ts`.
                 break None;
             }
@@ -599,7 +670,9 @@ impl<S: Snapshot> ScanPolicy<S> for LatestEntryPolicy {
                 return Ok(HandleRes::Skip(current_user_key));
             }
             write_key = cursors.write.key(&mut statistics.write);
-            if !Key::is_user_key_eq(write_key, current_user_key.as_encoded().as_slice()) {
+            // if !Key::is_user_key_eq(write_key, current_user_key.as_encoded().as_slice())
+            // {
+            if write_key != current_user_key.as_encoded().as_slice() {
                 // Meet another key. Needn't move write cursor to next key.
                 return Ok(HandleRes::Skip(current_user_key));
             }
@@ -607,6 +680,7 @@ impl<S: Snapshot> ScanPolicy<S> for LatestEntryPolicy {
         cursors.move_write_cursor_to_next_user_key(&current_user_key, statistics)?;
         Ok(match entry {
             Some(entry) => HandleRes::Return(entry),
+
             _ => HandleRes::Skip(current_user_key),
         })
     }
@@ -747,7 +821,15 @@ impl<S: Snapshot> ScanPolicy<S> for DeltaEntryPolicy {
     ) -> Result<HandleRes<Self::Output>> {
         loop {
             let write_value = cursors.write.value(&mut statistics.write);
-            let commit_ts = Key::decode_ts_from(cursors.write.key(&mut statistics.write))?;
+            // let commit_ts = Key::decode_ts_from(cursors.write.key(&mut
+            // statistics.write))?;
+            let commit_ts = TimeStamp::from_encoded(
+                cursors
+                    .write
+                    .timestamp(&mut statistics.write)
+                    .unwrap()
+                    .to_vec(),
+            );
 
             // commit_ts > cfg.ts never happens since the ForwardScanner will skip those
             // greater versions.
@@ -776,10 +858,12 @@ impl<S: Snapshot> ScanPolicy<S> for DeltaEntryPolicy {
                 if !cursors.write.valid()? {
                     return Ok(HandleRes::Skip(current_user_key));
                 }
-                if !Key::is_user_key_eq(
-                    cursors.write.key(&mut statistics.write),
-                    current_user_key.as_encoded(),
-                ) {
+                // if !Key::is_user_key_eq(
+                //     cursors.write.key(&mut statistics.write),
+                //     current_user_key.as_encoded(),
+                if cursors.write.key(&mut statistics.write)
+                    != current_user_key.as_encoded().as_slice()
+                {
                     return Ok(HandleRes::Skip(current_user_key));
                 }
 
@@ -1132,10 +1216,11 @@ mod latest_kv_tests {
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
                     CF_WRITE,
-                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    Key::from_raw(b"b"),
+                    Some(TimeStamp::new(ts)),
                     vec![b'R', ts as u8],
                 ),
-                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b"), None),
             ];
             write(&engine, &ctx, modifies);
         }
@@ -1200,10 +1285,11 @@ mod latest_kv_tests {
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
                     CF_WRITE,
-                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    Key::from_raw(b"b"),
+                    Some(TimeStamp::new(ts)),
                     vec![b'R', ts as u8],
                 ),
-                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b"), None),
             ];
             write(&engine, &ctx, modifies);
         }
@@ -1283,10 +1369,11 @@ mod latest_kv_tests {
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
                     CF_WRITE,
-                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    Key::from_raw(b"b"),
+                    Some(TimeStamp::new(ts)),
                     vec![b'R', ts as u8],
                 ),
-                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b"), None),
             ];
             write(&engine, &ctx, modifies);
         }
@@ -1619,10 +1706,11 @@ mod latest_entry_tests {
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
                     CF_WRITE,
-                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    Key::from_raw(b"b"),
+                    Some(TimeStamp::new(ts)),
                     vec![b'R', ts as u8],
                 ),
-                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b"), None),
             ];
             write(&engine, &ctx, modifies);
         }
@@ -1690,10 +1778,11 @@ mod latest_entry_tests {
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
                     CF_WRITE,
-                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    Key::from_raw(b"b"),
+                    Some(TimeStamp::new(ts)),
                     vec![b'R', ts as u8],
                 ),
-                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b"), None),
             ];
             write(&engine, &ctx, modifies);
         }
@@ -1774,10 +1863,11 @@ mod latest_entry_tests {
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
                     CF_WRITE,
-                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    Key::from_raw(b"b"),
+                    Some(TimeStamp::new(ts)),
                     vec![b'R', ts as u8],
                 ),
-                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b"), None),
             ];
             write(&engine, &ctx, modifies);
         }
@@ -1938,10 +2028,11 @@ mod latest_entry_tests {
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
                     CF_WRITE,
-                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    Key::from_raw(b"b"),
+                    Some(TimeStamp::new(ts)),
                     vec![b'R', ts as u8],
                 ),
-                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b"), None),
             ];
             write(&engine, &ctx, modifies);
         }
@@ -2051,10 +2142,11 @@ mod delta_entry_tests {
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
                     CF_WRITE,
-                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    Key::from_raw(b"b"),
+                    Some(TimeStamp::new(ts)),
                     vec![b'R', ts as u8],
                 ),
-                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b"), None),
             ];
             write(&engine, &ctx, modifies);
         }
@@ -2121,10 +2213,11 @@ mod delta_entry_tests {
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
                     CF_WRITE,
-                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    Key::from_raw(b"b"),
+                    Some(TimeStamp::new(ts)),
                     vec![b'R', ts as u8],
                 ),
-                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b"), None),
             ];
             write(&engine, &ctx, modifies);
         }
@@ -2207,10 +2300,11 @@ mod delta_entry_tests {
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
                     CF_WRITE,
-                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    Key::from_raw(b"b"),
+                    Some(TimeStamp::new(ts)),
                     vec![b'R', ts as u8],
                 ),
-                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b"), None),
             ];
             write(&engine, &ctx, modifies);
         }
@@ -2617,10 +2711,11 @@ mod delta_entry_tests {
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
                     CF_WRITE,
-                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    Key::from_raw(b"b"),
+                    Some(TimeStamp::new(ts)),
                     vec![b'R', ts as u8],
                 ),
-                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b"), None),
             ];
             write(&engine, &ctx, modifies);
         }

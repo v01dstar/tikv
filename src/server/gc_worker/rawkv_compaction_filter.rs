@@ -356,7 +356,7 @@ pub mod tests {
                     }),
                 )
             })
-            .map(|(k, v)| Modify::Put(CF_DEFAULT, Key::from_encoded_slice(k.as_slice()), v))
+            .map(|(k, v)| Modify::Put(CF_DEFAULT, Key::from_encoded_slice(k.as_slice()), None, v))
             .collect();
 
         let ctx = Context {
@@ -448,7 +448,7 @@ pub mod tests {
                     }),
                 )
             })
-            .map(|(k, v)| Modify::Put(CF_DEFAULT, Key::from_encoded_slice(k.as_slice()), v))
+            .map(|(k, v)| Modify::Put(CF_DEFAULT, Key::from_encoded_slice(k.as_slice()), None, v))
             .collect();
 
         let ctx = Context {
@@ -502,7 +502,7 @@ pub mod tests {
                     }),
                 )
             })
-            .map(|(k, v)| Modify::Put(CF_DEFAULT, Key::from_encoded_slice(k.as_slice()), v))
+            .map(|(k, v)| Modify::Put(CF_DEFAULT, Key::from_encoded_slice(k.as_slice()), None, v))
             .collect();
 
         let batch = WriteData::from_modifies(modifies);

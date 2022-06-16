@@ -2,7 +2,7 @@
 
 use std::{cell::Cell, cmp::Ordering, ops::Bound};
 
-use engine_traits::{CfName, IterOptions, DATA_KEY_PREFIX_LEN};
+use engine_traits::{CfName, IterOptions, CF_WRITE, DATA_KEY_PREFIX_LEN};
 use tikv_util::{
     keybuilder::KeyBuilder, metrics::CRITICAL_ERROR, panic_when_unexpected_key_or_data,
     set_panic_mark,
@@ -321,6 +321,17 @@ impl<I: Iterator> Cursor<I> {
     }
 
     #[inline]
+    pub fn timestamp(&self, statistics: &mut CfStatistics) -> Option<&[u8]> {
+        let timestamp = self.iter.timestamp();
+        if !self.mark_key_read() {
+            if let Some(ts) = timestamp {
+                statistics.flow_stats.read_bytes += ts.len();
+            }
+        }
+        timestamp
+    }
+
+    #[inline]
     pub fn value(&self, statistics: &mut CfStatistics) -> &[u8] {
         let value = self.iter.value();
         if !self.mark_value_read() {
@@ -438,6 +449,7 @@ pub struct CursorBuilder<'a, S: Snapshot> {
     hint_max_ts: Option<TimeStamp>,
     key_only: bool,
     max_skippable_internal_keys: u64,
+    full_scan_over_user_timestamp: bool,
 }
 
 impl<'a, S: 'a + Snapshot> CursorBuilder<'a, S> {
@@ -456,6 +468,7 @@ impl<'a, S: 'a + Snapshot> CursorBuilder<'a, S> {
             hint_max_ts: None,
             key_only: false,
             max_skippable_internal_keys: 0,
+            full_scan_over_user_timestamp: false,
         }
     }
 
@@ -535,6 +548,13 @@ impl<'a, S: 'a + Snapshot> CursorBuilder<'a, S> {
         self
     }
 
+    #[inline]
+    #[must_use]
+    pub fn full_scan_over_user_timestamp(mut self, full_scan: bool) -> Self {
+        self.full_scan_over_user_timestamp = full_scan;
+        self
+    }
+
     /// Build `Cursor` from the current configuration.
     pub fn build(self) -> Result<Cursor<S::Iter>> {
         let l_bound = if let Some(b) = self.lower_bound {
@@ -564,6 +584,12 @@ impl<'a, S: 'a + Snapshot> CursorBuilder<'a, S> {
         if self.prefix_seek {
             iter_opt.use_prefix_seek();
             iter_opt.set_prefix_same_as_start(true);
+        }
+        if self.cf == CF_WRITE {
+            iter_opt.set_timestamp(TimeStamp::max());
+            if self.full_scan_over_user_timestamp {
+                iter_opt.set_iter_start_ts(TimeStamp::zero());
+            }
         }
         Ok(Cursor::new(
             self.snapshot.iter(self.cf, iter_opt)?,

@@ -17,7 +17,7 @@ use engine_rocks::{config::BlobRunMode, RocksEngine, RocksSnapshot};
 use engine_test::raft::RaftTestEngine;
 use engine_traits::{
     Engines, Iterable, Peekable, RaftEngineDebug, RaftEngineReadOnly, TabletFactory, ALL_CFS,
-    CF_DEFAULT, CF_RAFT,
+    CF_DEFAULT, CF_RAFT, CF_WRITE,
 };
 use file_system::IoRateLimiter;
 use futures::executor::block_on;
@@ -191,6 +191,9 @@ pub fn new_put_cf_cmd(cf: &str, key: &[u8], value: &[u8]) -> Request {
     cmd.mut_put().set_key(key.to_vec());
     cmd.mut_put().set_value(value.to_vec());
     cmd.mut_put().set_cf(cf.to_string());
+    if cf == CF_WRITE {
+        cmd.mut_put().set_ts(0u64.to_be_bytes().to_vec());
+    }
     cmd
 }
 

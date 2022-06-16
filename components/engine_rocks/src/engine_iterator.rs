@@ -68,6 +68,12 @@ impl engine_traits::Iterator for RocksEngineIterator {
         self.0.value()
     }
 
+    fn timestamp(&self) -> Option<&[u8]> {
+        #[cfg(not(feature = "nortcheck"))]
+        assert!(self.valid().unwrap());
+        self.0.ts()
+    }
+
     fn valid(&self) -> Result<bool> {
         self.0.valid().map_err(r2e)
     }

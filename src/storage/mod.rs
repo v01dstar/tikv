@@ -839,7 +839,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     match snap_res {
                         Ok(snapshot) => Self::with_perf_context(CMD, || {
                             let buckets = snapshot.ext().get_buckets();
-                            match PointGetterBuilder::new(snapshot, start_ts)
+                            match PointGetterBuilder::new(snapshot, start_ts, true)
                                 .fill_cache(fill_cache)
                                 .isolation_level(isolation_level)
                                 .bypass_locks(bypass_locks)
@@ -1826,6 +1826,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let m = Modify::Put(
             Self::rawkv_cf(&cf, self.api_version)?,
             F::encode_raw_key_owned(key, None),
+            None,
             F::encode_raw_value_owned(raw_value),
         );
 
@@ -1866,6 +1867,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                 Modify::Put(
                     cf,
                     F::encode_raw_key_owned(k, None),
+                    None,
                     F::encode_raw_value_owned(raw_value),
                 )
             })
@@ -1913,8 +1915,8 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
     fn raw_delete_request_to_modify(cf: CfName, key: Vec<u8>) -> Modify {
         let key = F::encode_raw_key_owned(key, None);
         match F::TAG {
-            ApiVersion::V2 => Modify::Put(cf, key, ApiV2::ENCODED_LOGICAL_DELETE.to_vec()),
-            _ => Modify::Delete(cf, key),
+            ApiVersion::V2 => Modify::Put(cf, key, None, ApiV2::ENCODED_LOGICAL_DELETE.to_vec()),
+            _ => Modify::Delete(cf, key, None),
         }
     }
 
@@ -2762,6 +2764,15 @@ impl<S: Snapshot> Snapshot for TxnTestSnapshot<S> {
         key: &Key,
     ) -> tikv_kv::Result<Option<Value>> {
         self.snapshot.get_cf_opt(opts, cf, key)
+    }
+
+    fn get_val_ts_cf_opt(
+        &self,
+        opts: engine_traits::ReadOptions,
+        cf: CfName,
+        key: &Key,
+    ) -> tikv_kv::Result<Option<(Value, TimeStamp)>> {
+        self.snapshot.get_val_ts_cf_opt(opts, cf, key)
     }
 
     fn iter(

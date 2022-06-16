@@ -9,7 +9,7 @@ use raftstore::{
     store::{RegionIterator, RegionSnapshot, TxnExt},
     Error as RaftServerError,
 };
-use txn_types::{Key, Value};
+use txn_types::{Key, TimeStamp, Value};
 
 use crate::{
     self as kv, Error, Error as KvError, ErrorInner, Iterator as EngineIterator,
@@ -85,6 +85,19 @@ impl<S: Snapshot> EngineSnapshot for RegionSnapshot<S> {
         Ok(v.map(|v| v.to_vec()))
     }
 
+    fn get_val_ts_cf_opt(
+        &self,
+        opts: ReadOptions,
+        cf: CfName,
+        key: &Key,
+    ) -> kv::Result<Option<(Value, TimeStamp)>> {
+        fail_point!("raftkv_snapshot_get_cf", |_| Err(box_err!(
+            "injected error for get_cf"
+        )));
+        let v = box_try!(self.get_value_ts_cf_opt(&opts, cf, key.as_encoded()));
+        Ok(v.map(|(v, ts)| (v.to_vec(), TimeStamp::from_encoded(ts))))
+    }
+
     fn iter(&self, cf: CfName, iter_opt: IterOptions) -> kv::Result<Self::Iter> {
         fail_point!("raftkv_snapshot_iter", |_| Err(box_err!(
             "injected error for iter_cf"
@@ -148,6 +161,10 @@ impl<S: Snapshot> EngineIterator for RegionIterator<S> {
 
     fn key(&self) -> &[u8] {
         RegionIterator::key(self)
+    }
+
+    fn timestamp(&self) -> Option<&[u8]> {
+        RegionIterator::ts(self)
     }
 
     fn value(&self) -> &[u8] {

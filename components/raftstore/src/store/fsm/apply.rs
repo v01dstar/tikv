@@ -1581,7 +1581,11 @@ where
 {
     fn handle_put(&mut self, ctx: &mut ApplyContext<EK>, req: &Request) -> Result<()> {
         PEER_WRITE_CMD_COUNTER.put.inc();
-        let (key, value) = (req.get_put().get_key(), req.get_put().get_value());
+        let (key, ts, value) = (
+            req.get_put().get_key(),
+            req.get_put().get_ts(),
+            req.get_put().get_value(),
+        );
         // region key range has no data prefix, so we must use origin key to check.
         util::check_key_in_region(key, &self.region)?;
         if let Some(s) = self.buckets.as_mut() {
@@ -1592,14 +1596,32 @@ where
         let key = ctx.key_buffer.as_slice();
 
         self.metrics.size_diff_hint += key.len() as i64;
+        self.metrics.size_diff_hint += ts.len() as i64;
         self.metrics.size_diff_hint += value.len() as i64;
-        if !req.get_put().get_cf().is_empty() {
-            let cf = req.get_put().get_cf();
-            // TODO: don't allow write preseved cfs.
-            if cf == CF_LOCK {
-                self.metrics.lock_cf_written_bytes += key.len() as u64;
-                self.metrics.lock_cf_written_bytes += value.len() as u64;
+        let mut cf = req.get_put().get_cf();
+        if cf == CF_LOCK {
+            self.metrics.lock_cf_written_bytes += key.len() as u64;
+            self.metrics.lock_cf_written_bytes += ts.len() as u64;
+            self.metrics.lock_cf_written_bytes += value.len() as u64;
+        }
+        if ts.len() > 0 {
+            if cf.is_empty() {
+                cf = CF_DEFAULT;
             }
+            ctx.kv_wb
+                .put_cf_with_ts(cf, key, ts, value)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "{} failed to write ({}, {}) to cf {}: {:?}",
+                        self.tag,
+                        log_wrappers::Value::key(key),
+                        log_wrappers::Value::value(value),
+                        cf,
+                        e
+                    )
+                });
+        } else if !cf.is_empty() {
+            // TODO: don't allow write preseved cfs.
             // TODO: check whether cf exists or not.
             ctx.kv_wb.put_cf(cf, key, value).unwrap_or_else(|e| {
                 panic!(
@@ -1627,7 +1649,7 @@ where
 
     fn handle_delete(&mut self, ctx: &mut ApplyContext<EK>, req: &Request) -> Result<()> {
         PEER_WRITE_CMD_COUNTER.delete.inc();
-        let key = req.get_delete().get_key();
+        let (key, ts) = (req.get_delete().get_key(), req.get_delete().get_ts());
         // region key range has no data prefix, so we must use origin key to check.
         util::check_key_in_region(key, &self.region)?;
         if let Some(s) = self.buckets.as_mut() {
@@ -1640,8 +1662,28 @@ where
         // since size_diff_hint is not accurate, so we just skip calculate the value
         // size.
         self.metrics.size_diff_hint -= key.len() as i64;
-        if !req.get_delete().get_cf().is_empty() {
-            let cf = req.get_delete().get_cf();
+        let mut cf = req.get_delete().get_cf();
+        if cf == CF_LOCK {
+            // delete is a kind of write for RocksDB.
+            self.metrics.lock_cf_written_bytes += key.len() as u64;
+        } else {
+            self.metrics.delete_keys_hint += 1;
+        }
+        if ts.len() > 0 {
+            if cf.is_empty() {
+                cf = CF_DEFAULT;
+            }
+            ctx.kv_wb
+                .delete_cf_with_ts(cf, key, ts)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "{} failed to delete {}: {}",
+                        self.tag,
+                        log_wrappers::Value::key(key),
+                        e
+                    )
+                });
+        } else if !cf.is_empty() {
             // TODO: check whether cf exists or not.
             ctx.kv_wb.delete_cf(cf, key).unwrap_or_else(|e| {
                 panic!(
@@ -1651,13 +1693,6 @@ where
                     e
                 )
             });
-
-            if cf == CF_LOCK {
-                // delete is a kind of write for RocksDB.
-                self.metrics.lock_cf_written_bytes += key.len() as u64;
-            } else {
-                self.metrics.delete_keys_hint += 1;
-            }
         } else {
             ctx.kv_wb.delete(key).unwrap_or_else(|e| {
                 panic!(
@@ -1667,7 +1702,6 @@ where
                     e
                 )
             });
-            self.metrics.delete_keys_hint += 1;
         }
 
         Ok(())

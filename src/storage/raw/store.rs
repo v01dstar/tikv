@@ -3,10 +3,10 @@
 use std::{marker::PhantomData, time::Duration};
 
 use api_version::{ApiV1, ApiV1Ttl, ApiV2, KvFormat};
-use engine_traits::{CfName, IterOptions, DATA_KEY_PREFIX_LEN};
+use engine_traits::{CfName, IterOptions, ReadOptions, CF_WRITE, DATA_KEY_PREFIX_LEN};
 use kvproto::kvrpcpb::{ApiVersion, KeyRange};
 use tikv_util::time::Instant;
-use txn_types::{Key, KvPair};
+use txn_types::{Key, KvPair, TimeStamp};
 use yatp::task::future::reschedule;
 
 use super::{encoded::RawEncodeSnapshot, raw_mvcc::RawMvccSnapshot};
@@ -86,11 +86,13 @@ impl<'a, S: Snapshot> RawStore<S> {
                 if key_only {
                     option.set_key_only(key_only);
                 }
+                option.set_iter_start_ts(TimeStamp::zero());
                 inner
                     .forward_raw_scan(cf, start_key, limit, statistics, option, key_only)
                     .await
             }
             RawStore::V1Ttl(inner) => {
+                option.set_iter_start_ts(TimeStamp::zero());
                 inner
                     .forward_raw_scan(cf, start_key, limit, statistics, option, key_only)
                     .await
@@ -121,11 +123,13 @@ impl<'a, S: Snapshot> RawStore<S> {
                 if key_only {
                     option.set_key_only(key_only);
                 }
+                option.set_iter_start_ts(TimeStamp::zero());
                 inner
                     .reverse_raw_scan(cf, start_key, limit, statistics, option, key_only)
                     .await
             }
             RawStore::V1Ttl(inner) => {
+                option.set_iter_start_ts(TimeStamp::zero());
                 inner
                     .reverse_raw_scan(cf, start_key, limit, statistics, option, key_only)
                     .await
@@ -173,12 +177,26 @@ impl<'a, S: Snapshot, F: KvFormat> RawStoreInner<S, F> {
     ) -> Result<Option<Vec<u8>>> {
         // no scan_count for this kind of op.
         let key_len = key.as_encoded().len();
-        self.snapshot.get_cf(cf, key).map(|value| {
-            stats.data.flow_stats.read_keys = 1;
-            stats.data.flow_stats.read_bytes =
-                key_len + value.as_ref().map(|v| v.len()).unwrap_or(0);
-            value
-        })
+        if cf == CF_WRITE {
+            let key_clone = key.clone();
+            let user_timestamp = key_clone.decode_ts().unwrap();
+            let user_key = key_clone.truncate_ts().unwrap();
+            let mut opts = ReadOptions::default();
+            opts.set_timestamp(user_timestamp);
+            self.snapshot.get_cf_opt(opts, cf, &user_key).map(|value| {
+                stats.data.flow_stats.read_keys = 1;
+                stats.data.flow_stats.read_bytes =
+                    key_len + value.as_ref().map(|v| v.len()).unwrap_or(0);
+                value
+            })
+        } else {
+            self.snapshot.get_cf(cf, key).map(|value| {
+                stats.data.flow_stats.read_keys = 1;
+                stats.data.flow_stats.read_bytes =
+                    key_len + value.as_ref().map(|v| v.len()).unwrap_or(0);
+                value
+            })
+        }
     }
 
     /// Scan raw keys in [`start_key`, `end_key`), returns at most `limit` keys.

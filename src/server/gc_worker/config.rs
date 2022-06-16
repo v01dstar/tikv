@@ -30,7 +30,7 @@ impl Default for GcConfig {
             ratio_threshold: DEFAULT_GC_RATIO_THRESHOLD,
             batch_keys: DEFAULT_GC_BATCH_KEYS,
             max_write_bytes_per_sec: ReadableSize(DEFAULT_GC_MAX_WRITE_BYTES_PER_SEC),
-            enable_compaction_filter: true,
+            enable_compaction_filter: false,
             compaction_filter_skip_version_check: false,
         }
     }
@@ -53,11 +53,10 @@ impl ConfigManager for GcWorkerConfigManager {
         &mut self,
         change: ConfigChange,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        {
-            let change = change.clone();
-            self.0
-                .update(move |cfg: &mut GcConfig| cfg.update(change))?;
-        }
+        // {
+        //     let change = change.clone();
+        //     self.0.update(move |cfg: &mut GcConfig| cfg.update(change));
+        // }
         info!(
             "GC worker config changed";
             "change" => ?change,

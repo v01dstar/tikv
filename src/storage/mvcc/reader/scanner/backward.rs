@@ -126,10 +126,12 @@ impl<S: Snapshot> BackwardKvScanner<S> {
                 let res = match (w_key, l_key) {
                     (None, None) => return Ok(None),
                     (None, Some(lk)) => (lk, false, true),
-                    (Some(wk), None) => (Key::truncate_ts_for(wk)?, true, false),
+                    //(Some(wk), None) => (Key::truncate_ts_for(wk)?, true, false),
+                    (Some(wk), None) => (wk, true, false),
                     (Some(wk), Some(lk)) => {
-                        let write_user_key = Key::truncate_ts_for(wk)?;
-                        match write_user_key.cmp(lk) {
+                        // let write_user_key = Key::truncate_ts_for(wk)?;
+                        // match write_user_key.cmp(lk) {
+                        match wk.cmp(lk) {
                             Ordering::Less => {
                                 // We are scanning from largest user key to smallest user key, so
                                 // this indicate that we meet a lock first, thus its corresponding
@@ -138,9 +140,10 @@ impl<S: Snapshot> BackwardKvScanner<S> {
                             }
                             Ordering::Greater => {
                                 // We meet write first, so the lock of the write key does not exist.
-                                (write_user_key, true, false)
+                                // (write_user_key, true, false)
+                                (wk, true, false)
                             }
-                            Ordering::Equal => (write_user_key, true, true),
+                            Ordering::Equal => (wk, true, true),
                         }
                     }
                 };
@@ -230,32 +233,176 @@ impl<S: Snapshot> BackwardKvScanner<S> {
         met_prev_user_key: &mut bool,
     ) -> Result<Option<Value>> {
         assert!(self.write_cursor.valid()?);
+        if false {
+            // At first, we try to use several `prev()` to get the desired version.
 
-        // At first, we try to use several `prev()` to get the desired version.
+            // We need to save last desired version, because when we may move to an unwanted
+            // version at any time.
+            let mut last_version = None;
+            let mut last_checked_commit_ts = TimeStamp::zero();
 
-        // We need to save last desired version, because when we may move to an unwanted
-        // version at any time.
-        let mut last_version = None;
-        let mut last_checked_commit_ts = TimeStamp::zero();
+            for i in 0..REVERSE_SEEK_BOUND {
+                if i > 0 {
+                    // We are already pointing at the smallest version, so we don't need to prev()
+                    // for the first iteration. So we will totally call `prev()` function
+                    // `REVERSE_SEEK_BOUND - 1` times.
+                    self.write_cursor.prev(&mut self.statistics.write);
+                    if !self.write_cursor.valid()? {
+                        // Key space ended. We use `last_version` as the return.
+                        return self.handle_last_version(last_version, user_key);
+                    }
+                }
 
-        for i in 0..REVERSE_SEEK_BOUND {
-            if i > 0 {
-                // We are already pointing at the smallest version, so we don't need to prev()
-                // for the first iteration. So we will totally call `prev()` function
-                // `REVERSE_SEEK_BOUND - 1` times.
-                self.write_cursor.prev(&mut self.statistics.write);
-                if !self.write_cursor.valid()? {
-                    // Key space ended. We use `last_version` as the return.
+                let mut is_done = false;
+                {
+                    let current_key = self.write_cursor.key(&mut self.statistics.write);
+                    last_checked_commit_ts = Key::decode_ts_from(current_key)?;
+
+                    if !Key::is_user_key_eq(current_key, user_key.as_encoded().as_slice()) {
+                        // Meet another key, use `last_version` as the return.
+                        *met_prev_user_key = true;
+                        is_done = true;
+                    } else if last_checked_commit_ts > ts {
+                        // Meet an unwanted version, use `last_version` as the return as well.
+                        is_done = true;
+                        if self.met_newer_ts_data == NewerTsCheckState::NotMetYet {
+                            self.met_newer_ts_data = NewerTsCheckState::Met;
+                        }
+                        if self.cfg.isolation_level == IsolationLevel::RcCheckTs {
+                            // TODO: the more write recent version with `LOCK` or `ROLLBACK` write
+                            // type       could be skipped.
+                            return Err(WriteConflict {
+                                start_ts: self.cfg.ts,
+                                conflict_start_ts: Default::default(),
+                                conflict_commit_ts: last_checked_commit_ts,
+                                key: current_key.into(),
+                                primary: vec![],
+                            }
+                            .into());
+                        }
+                    }
+                }
+                if is_done {
                     return self.handle_last_version(last_version, user_key);
+                }
+
+                let write = WriteRef::parse(self.write_cursor.value(&mut self.statistics.write))
+                    .map_err(Error::from)?;
+
+                match write.write_type {
+                    WriteType::Put | WriteType::Delete => last_version = Some(write.to_owned()),
+                    WriteType::Lock | WriteType::Rollback => {}
                 }
             }
 
-            let mut is_done = false;
-            {
-                let current_key = self.write_cursor.key(&mut self.statistics.write);
-                last_checked_commit_ts = Key::decode_ts_from(current_key)?;
+            // At this time, we must have current commit_ts <= ts. If commit_ts == ts,
+            // we don't need to seek any more and we can just utilize `last_version`.
+            if last_checked_commit_ts == ts {
+                if self.met_newer_ts_data == NewerTsCheckState::NotMetYet {
+                    // move cursor backward again to check whether there are larger ts.
+                    self.write_cursor.prev(&mut self.statistics.write);
+                    if self.write_cursor.valid()? {
+                        let current_key = self.write_cursor.key(&mut self.statistics.write);
+                        if Key::is_user_key_eq(current_key, user_key.as_encoded().as_slice()) {
+                            self.met_newer_ts_data = NewerTsCheckState::Met;
+                        } else {
+                            *met_prev_user_key = true;
+                        }
+                    }
+                }
+                return self.handle_last_version(last_version, user_key);
+            }
+            assert!(ts > last_checked_commit_ts);
 
-                if !Key::is_user_key_eq(current_key, user_key.as_encoded().as_slice()) {
+            // After several `prev()`, we still not get the latest version for the specified
+            // ts, use seek to locate the latest version.
+
+            // Check whether newer version exists.
+            let mut use_near_seek = false;
+            let mut seek_key = user_key.clone();
+
+            if self.met_newer_ts_data == NewerTsCheckState::NotMetYet {
+                seek_key = seek_key.append_ts(TimeStamp::max());
+                self.write_cursor
+                    .internal_seek(&seek_key, &mut self.statistics.write)?;
+                assert!(self.write_cursor.valid()?);
+                seek_key = seek_key.truncate_ts()?;
+                use_near_seek = true;
+
+                let current_key = self.write_cursor.key(&mut self.statistics.write);
+                debug_assert!(Key::is_user_key_eq(
+                    current_key,
+                    user_key.as_encoded().as_slice()
+                ));
+                let key_ts = Key::decode_ts_from(current_key)?;
+                if key_ts > ts {
+                    self.met_newer_ts_data = NewerTsCheckState::Met
+                }
+            }
+
+            // `user_key` must have reserved space here, so its clone `seek_key` has
+            // reserved space too. Thus no reallocation happens in `append_ts`.
+            seek_key = seek_key.append_ts(ts);
+            if use_near_seek {
+                self.write_cursor
+                    .near_seek(&seek_key, &mut self.statistics.write)?;
+            } else {
+                self.write_cursor
+                    .internal_seek(&seek_key, &mut self.statistics.write)?;
+            }
+            assert!(self.write_cursor.valid()?);
+
+            loop {
+                // After seek, or after some `next()`, we may reach `last_checked_commit_ts`
+                // again. It means we have checked all versions for this user
+                // key. We use `last_version` as return.
+                let current_ts = {
+                    let current_key = self.write_cursor.key(&mut self.statistics.write);
+                    // We should never reach another user key.
+                    debug_assert!(Key::is_user_key_eq(
+                        current_key,
+                        user_key.as_encoded().as_slice()
+                    ));
+                    Key::decode_ts_from(current_key)?
+                };
+                if current_ts <= last_checked_commit_ts {
+                    // We reach the last handled key
+                    return self.handle_last_version(last_version, user_key);
+                }
+
+                let write = WriteRef::parse(self.write_cursor.value(&mut self.statistics.write))?;
+
+                if !write.check_gc_fence_as_latest_version(self.cfg.ts) {
+                    return Ok(None);
+                }
+
+                match write.write_type {
+                    WriteType::Put => {
+                        let write = write.to_owned();
+                        return Ok(Some(self.reverse_load_data_by_write(write, user_key)?));
+                    }
+                    WriteType::Delete => return Ok(None),
+                    WriteType::Lock | WriteType::Rollback => {
+                        // Continue iterate next `write`.
+                        self.write_cursor.next(&mut self.statistics.write);
+                        assert!(self.write_cursor.valid()?);
+                    }
+                }
+            }
+        } else {
+            let mut last_version = None;
+
+            loop {
+                let mut is_done = false;
+                let current_key = self.write_cursor.key(&mut self.statistics.write);
+                let last_checked_commit_ts = TimeStamp::from_encoded(
+                    self.write_cursor
+                        .timestamp(&mut self.statistics.write)
+                        .unwrap()
+                        .to_vec(),
+                );
+
+                if current_key != user_key.as_encoded().as_slice() {
                     // Meet another key, use `last_version` as the return.
                     *met_prev_user_key = true;
                     is_done = true;
@@ -278,111 +425,21 @@ impl<S: Snapshot> BackwardKvScanner<S> {
                         .into());
                     }
                 }
-            }
-            if is_done {
-                return self.handle_last_version(last_version, user_key);
-            }
+                if is_done {
+                    return self.handle_last_version(last_version, user_key);
+                }
 
-            let write = WriteRef::parse(self.write_cursor.value(&mut self.statistics.write))
-                .map_err(Error::from)?;
+                let write = WriteRef::parse(self.write_cursor.value(&mut self.statistics.write))
+                    .map_err(Error::from)?;
 
-            match write.write_type {
-                WriteType::Put | WriteType::Delete => last_version = Some(write.to_owned()),
-                WriteType::Lock | WriteType::Rollback => {}
-            }
-        }
-
-        // At this time, we must have current commit_ts <= ts. If commit_ts == ts,
-        // we don't need to seek any more and we can just utilize `last_version`.
-        if last_checked_commit_ts == ts {
-            if self.met_newer_ts_data == NewerTsCheckState::NotMetYet {
-                // move cursor backward again to check whether there are larger ts.
+                match write.write_type {
+                    WriteType::Put | WriteType::Delete => last_version = Some(write.to_owned()),
+                    WriteType::Lock | WriteType::Rollback => {}
+                }
                 self.write_cursor.prev(&mut self.statistics.write);
-                if self.write_cursor.valid()? {
-                    let current_key = self.write_cursor.key(&mut self.statistics.write);
-                    if Key::is_user_key_eq(current_key, user_key.as_encoded().as_slice()) {
-                        self.met_newer_ts_data = NewerTsCheckState::Met;
-                    } else {
-                        *met_prev_user_key = true;
-                    }
-                }
-            }
-            return self.handle_last_version(last_version, user_key);
-        }
-        assert!(ts > last_checked_commit_ts);
-
-        // After several `prev()`, we still not get the latest version for the specified
-        // ts, use seek to locate the latest version.
-
-        // Check whether newer version exists.
-        let mut use_near_seek = false;
-        let mut seek_key = user_key.clone();
-
-        if self.met_newer_ts_data == NewerTsCheckState::NotMetYet {
-            seek_key = seek_key.append_ts(TimeStamp::max());
-            self.write_cursor
-                .internal_seek(&seek_key, &mut self.statistics.write)?;
-            assert!(self.write_cursor.valid()?);
-            seek_key = seek_key.truncate_ts()?;
-            use_near_seek = true;
-
-            let current_key = self.write_cursor.key(&mut self.statistics.write);
-            debug_assert!(Key::is_user_key_eq(
-                current_key,
-                user_key.as_encoded().as_slice()
-            ));
-            let key_ts = Key::decode_ts_from(current_key)?;
-            if key_ts > ts {
-                self.met_newer_ts_data = NewerTsCheckState::Met
-            }
-        }
-
-        // `user_key` must have reserved space here, so its clone `seek_key` has
-        // reserved space too. Thus no reallocation happens in `append_ts`.
-        seek_key = seek_key.append_ts(ts);
-        if use_near_seek {
-            self.write_cursor
-                .near_seek(&seek_key, &mut self.statistics.write)?;
-        } else {
-            self.write_cursor
-                .internal_seek(&seek_key, &mut self.statistics.write)?;
-        }
-        assert!(self.write_cursor.valid()?);
-
-        loop {
-            // After seek, or after some `next()`, we may reach `last_checked_commit_ts`
-            // again. It means we have checked all versions for this user key.
-            // We use `last_version` as return.
-            let current_ts = {
-                let current_key = self.write_cursor.key(&mut self.statistics.write);
-                // We should never reach another user key.
-                debug_assert!(Key::is_user_key_eq(
-                    current_key,
-                    user_key.as_encoded().as_slice()
-                ));
-                Key::decode_ts_from(current_key)?
-            };
-            if current_ts <= last_checked_commit_ts {
-                // We reach the last handled key
-                return self.handle_last_version(last_version, user_key);
-            }
-
-            let write = WriteRef::parse(self.write_cursor.value(&mut self.statistics.write))?;
-
-            if !write.check_gc_fence_as_latest_version(self.cfg.ts) {
-                return Ok(None);
-            }
-
-            match write.write_type {
-                WriteType::Put => {
-                    let write = write.to_owned();
-                    return Ok(Some(self.reverse_load_data_by_write(write, user_key)?));
-                }
-                WriteType::Delete => return Ok(None),
-                WriteType::Lock | WriteType::Rollback => {
-                    // Continue iterate next `write`.
-                    self.write_cursor.next(&mut self.statistics.write);
-                    assert!(self.write_cursor.valid()?);
+                if !self.write_cursor.valid()? {
+                    // Key space ended. We use `last_version` as the return.
+                    return self.handle_last_version(last_version, user_key);
                 }
             }
         }
@@ -449,29 +506,44 @@ impl<S: Snapshot> BackwardKvScanner<S> {
     /// another user key, we `seek_for_prev()`.
     #[inline]
     fn move_write_cursor_to_prev_user_key(&mut self, current_user_key: &Key) -> Result<()> {
-        for i in 0..SEEK_BOUND {
-            if i > 0 {
-                self.write_cursor.prev(&mut self.statistics.write);
+        if false {
+            for i in 0..SEEK_BOUND {
+                if i > 0 {
+                    self.write_cursor.prev(&mut self.statistics.write);
+                }
+                if !self.write_cursor.valid()? {
+                    // Key space ended. We are done here.
+                    return Ok(());
+                }
+                {
+                    let current_key = self.write_cursor.key(&mut self.statistics.write);
+                    if !Key::is_user_key_eq(current_key, current_user_key.as_encoded().as_slice()) {
+                        // Found another user key. We are done here.
+                        return Ok(());
+                    }
+                }
             }
-            if !self.write_cursor.valid()? {
-                // Key space ended. We are done here.
-                return Ok(());
-            }
-            {
+
+            // We have not found another user key for now, so we directly `seek_for_prev()`.
+            // After that, we must pointing to another key, or out of bound.
+            self.write_cursor
+                .internal_seek_for_prev(current_user_key, &mut self.statistics.write)?;
+
+            Ok(())
+        } else {
+            loop {
+                if !self.write_cursor.valid()? {
+                    // Key space ended. We are done here.
+                    return Ok(());
+                }
                 let current_key = self.write_cursor.key(&mut self.statistics.write);
-                if !Key::is_user_key_eq(current_key, current_user_key.as_encoded().as_slice()) {
+                if current_key != current_user_key.as_encoded().as_slice() {
                     // Found another user key. We are done here.
                     return Ok(());
                 }
+                self.write_cursor.prev(&mut self.statistics.write);
             }
         }
-
-        // We have not found another user key for now, so we directly `seek_for_prev()`.
-        // After that, we must pointing to another key, or out of bound.
-        self.write_cursor
-            .internal_seek_for_prev(current_user_key, &mut self.statistics.write)?;
-
-        Ok(())
     }
 
     /// Create the default cursor if it doesn't exist.
@@ -534,10 +606,11 @@ mod tests {
                     // ts is rather small, so it is ok to `as u8`
                     Modify::Put(
                         CF_WRITE,
-                        Key::from_raw(k).append_ts(TimeStamp::new(ts)),
+                        Key::from_raw(k),
+                        Some(TimeStamp::new(ts)),
                         vec![b'R', ts as u8],
                     ),
-                    Modify::Delete(CF_LOCK, Key::from_raw(k)),
+                    Modify::Delete(CF_LOCK, Key::from_raw(k), None),
                 ];
                 write(&engine, &ctx, modifies);
             }
@@ -561,10 +634,11 @@ mod tests {
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
                     CF_WRITE,
-                    Key::from_raw(k).append_ts(TimeStamp::new(ts)),
+                    Key::from_raw(k),
+                    Some(TimeStamp::new(ts)),
                     vec![b'R', ts as u8],
                 ),
-                Modify::Delete(CF_LOCK, Key::from_raw(k)),
+                Modify::Delete(CF_LOCK, Key::from_raw(k), None),
             ];
             write(&engine, &ctx, modifies);
         }
@@ -584,10 +658,11 @@ mod tests {
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
                     CF_WRITE,
-                    Key::from_raw(k).append_ts(TimeStamp::new(ts)),
+                    Key::from_raw(k),
+                    Some(TimeStamp::new(ts)),
                     vec![b'R', ts as u8],
                 ),
-                Modify::Delete(CF_LOCK, Key::from_raw(k)),
+                Modify::Delete(CF_LOCK, Key::from_raw(k), None),
             ];
             write(&engine, &ctx, modifies);
         }
@@ -813,10 +888,11 @@ mod tests {
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
                     CF_WRITE,
-                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    Key::from_raw(b"b"),
+                    Some(TimeStamp::new(ts)),
                     vec![b'R', ts as u8],
                 ),
-                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b"), None),
             ];
             write(&engine, &ctx, modifies);
         }
@@ -899,10 +975,11 @@ mod tests {
                 // ts is rather small, so it is ok to `as u8`
                 Modify::Put(
                     CF_WRITE,
-                    Key::from_raw(b"b").append_ts(TimeStamp::new(ts)),
+                    Key::from_raw(b"b"),
+                    Some(TimeStamp::new(ts)),
                     vec![b'R', ts as u8],
                 ),
-                Modify::Delete(CF_LOCK, Key::from_raw(b"b")),
+                Modify::Delete(CF_LOCK, Key::from_raw(b"b"), None),
             ];
             write(&engine, &ctx, modifies);
         }

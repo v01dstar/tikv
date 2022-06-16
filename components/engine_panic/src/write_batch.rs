@@ -61,11 +61,16 @@ impl Mutable for PanicWriteBatch {
     fn put_cf(&mut self, cf: &str, key: &[u8], value: &[u8]) -> Result<()> {
         panic!()
     }
-
+    fn put_cf_with_ts(&mut self, cf: &str, key: &[u8], ts: &[u8], value: &[u8]) -> Result<()> {
+        panic!()
+    }
     fn delete(&mut self, key: &[u8]) -> Result<()> {
         panic!()
     }
     fn delete_cf(&mut self, cf: &str, key: &[u8]) -> Result<()> {
+        panic!()
+    }
+    fn delete_cf_with_ts(&mut self, cf: &str, key: &[u8], ts: &[u8]) -> Result<()> {
         panic!()
     }
     fn delete_range(&mut self, begin_key: &[u8], end_key: &[u8]) -> Result<()> {

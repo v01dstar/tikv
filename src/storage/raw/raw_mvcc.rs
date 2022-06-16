@@ -1,6 +1,6 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use engine_traits::{CfName, IterOptions, ReadOptions, CF_DEFAULT, DATA_KEY_PREFIX_LEN};
+use engine_traits::{CfName, IterOptions, ReadOptions, CF_DEFAULT, CF_WRITE, DATA_KEY_PREFIX_LEN};
 use txn_types::{Key, TimeStamp, Value};
 
 use crate::storage::kv::{Error, ErrorInner, Iterator, Result, Snapshot};
@@ -54,8 +54,20 @@ impl<S: Snapshot> Snapshot for RawMvccSnapshot<S> {
         self.seek_first_key_value_cf(cf, Some(opts), key)
     }
 
+    fn get_val_ts_cf_opt(
+        &self,
+        opts: ReadOptions,
+        cf: CfName,
+        key: &Key,
+    ) -> Result<Option<(Value, TimeStamp)>> {
+        self.snap.get_val_ts_cf_opt(opts, cf, key)
+    }
+
     fn iter(&self, cf: CfName, iter_opt: IterOptions) -> Result<Self::Iter> {
-        Ok(RawMvccIterator::new(self.snap.iter(cf, iter_opt)?))
+        Ok(RawMvccIterator::new(
+            self.snap.iter(cf, iter_opt)?,
+            cf == CF_WRITE,
+        ))
     }
 
     #[inline]
@@ -76,9 +88,11 @@ impl<S: Snapshot> Snapshot for RawMvccSnapshot<S> {
 pub struct RawMvccIterator<I: Iterator> {
     inner: I,
     cur_key: Option<Vec<u8>>,
+    cur_timestamp: Option<Vec<u8>>,
     cur_value: Option<Vec<u8>>,
     is_valid: Option<bool>,
     is_forward: bool,
+    uses_user_timestamp: bool,
 }
 
 fn is_user_key_eq(left: &[u8], right: &[u8]) -> bool {
@@ -91,13 +105,15 @@ fn is_user_key_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 impl<I: Iterator> RawMvccIterator<I> {
-    fn new(inner: I) -> Self {
+    fn new(inner: I, uses_user_timestamp: bool) -> Self {
         RawMvccIterator {
             inner,
             cur_key: None,
+            cur_timestamp: None,
             cur_value: None,
             is_valid: None,
             is_forward: true,
+            uses_user_timestamp,
         }
     }
 
@@ -111,6 +127,11 @@ impl<I: Iterator> RawMvccIterator<I> {
         } else {
             self.cur_key = Some(Vec::from(self.inner.key()));
         };
+        if let Some(ts) = self.inner.timestamp() {
+            self.cur_timestamp = Some(Vec::from(ts));
+        } else {
+            self.cur_timestamp = None;
+        }
         if let Some(ref mut value) = self.cur_value {
             value.clear();
             value.extend_from_slice(self.inner.value());
@@ -125,6 +146,7 @@ impl<I: Iterator> RawMvccIterator<I> {
 
     fn clear_cur_kv(&mut self) {
         self.cur_key = None;
+        self.cur_timestamp = None;
         self.cur_value = None;
         self.is_valid = None;
     }
@@ -161,11 +183,16 @@ impl<I: Iterator> Iterator for RawMvccIterator<I> {
                 "invalid raw mvcc operation",
             ))));
         }
-        let cur_key = self.inner.key().to_owned();
-        let mut res = self.inner.next()?;
-        while res && self.inner.valid()? && is_user_key_eq(&cur_key, self.inner.key()) {
-            res = self.inner.next()?;
-        }
+        let res = if self.uses_user_timestamp {
+            self.inner.next()?
+        } else {
+            let cur_key = self.inner.key().to_owned();
+            let mut res = self.inner.next()?;
+            while res && self.inner.valid()? && is_user_key_eq(&cur_key, self.inner.key()) {
+                res = self.inner.next()?;
+            }
+            res
+        };
         self.clear_cur_kv();
         Ok(res)
     }
@@ -176,7 +203,11 @@ impl<I: Iterator> Iterator for RawMvccIterator<I> {
                 "invalid raw mvcc operation",
             ))));
         }
-        self.move_to_prev_max_ts()
+        if self.uses_user_timestamp {
+            self.inner.prev()
+        } else {
+            self.move_to_prev_max_ts()
+        }
     }
 
     fn seek(&mut self, key: &Key) -> Result<bool> {
@@ -188,7 +219,11 @@ impl<I: Iterator> Iterator for RawMvccIterator<I> {
     fn seek_for_prev(&mut self, key: &Key) -> Result<bool> {
         self.is_forward = false;
         if self.inner.seek_for_prev(key)? {
-            self.move_to_prev_max_ts()
+            if self.uses_user_timestamp {
+                Ok(true)
+            } else {
+                self.move_to_prev_max_ts()
+            }
         } else {
             Ok(false)
         }
@@ -203,7 +238,11 @@ impl<I: Iterator> Iterator for RawMvccIterator<I> {
     fn seek_to_last(&mut self) -> Result<bool> {
         self.is_forward = false;
         if self.inner.seek_to_last()? {
-            self.move_to_prev_max_ts()
+            if self.uses_user_timestamp {
+                Ok(true)
+            } else {
+                self.move_to_prev_max_ts()
+            }
         } else {
             Ok(false)
         }
@@ -220,13 +259,25 @@ impl<I: Iterator> Iterator for RawMvccIterator<I> {
     fn key(&self) -> &[u8] {
         // need map_or_else to lazy evaluate the default func, as it will abort when
         // invalid.
-        self.cur_key.as_deref().unwrap_or_else(|| self.inner.key())
+        if self.uses_user_timestamp {
+            self.inner.key()
+        } else {
+            self.cur_key.as_deref().unwrap_or_else(|| self.inner.key())
+        }
+    }
+
+    fn timestamp(&self) -> Option<&[u8]> {
+        self.inner.timestamp()
     }
 
     fn value(&self) -> &[u8] {
-        self.cur_value
-            .as_deref()
-            .unwrap_or_else(|| self.inner.value())
+        if self.uses_user_timestamp {
+            self.inner.value()
+        } else {
+            self.cur_value
+                .as_deref()
+                .unwrap_or_else(|| self.inner.value())
+        }
     }
 }
 
@@ -288,6 +339,7 @@ mod tests {
             let m = Modify::Put(
                 CF_DEFAULT,
                 ApiV2::encode_raw_key_owned(key, Some(ts.into())),
+                None,
                 ApiV2::encode_raw_value_owned(raw_value),
             );
             let batch = WriteData::from_modifies(vec![m]);

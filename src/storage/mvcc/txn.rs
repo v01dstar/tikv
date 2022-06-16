@@ -97,7 +97,7 @@ impl MvccTxn {
     }
 
     pub(crate) fn put_lock(&mut self, key: Key, lock: &Lock) {
-        let write = Modify::Put(CF_LOCK, key, lock.to_bytes());
+        let write = Modify::Put(CF_LOCK, key, None, lock.to_bytes());
         self.write_size += write.size();
         self.modifies.push(write);
     }
@@ -112,32 +112,32 @@ impl MvccTxn {
 
     pub(crate) fn unlock_key(&mut self, key: Key, pessimistic: bool) -> Option<ReleasedLock> {
         let released = ReleasedLock::new(&key, pessimistic);
-        let write = Modify::Delete(CF_LOCK, key);
+        let write = Modify::Delete(CF_LOCK, key, None);
         self.write_size += write.size();
         self.modifies.push(write);
         Some(released)
     }
 
     pub(crate) fn put_value(&mut self, key: Key, ts: TimeStamp, value: Value) {
-        let write = Modify::Put(CF_DEFAULT, key.append_ts(ts), value);
+        let write = Modify::Put(CF_DEFAULT, key.append_ts(ts), None, value);
         self.write_size += write.size();
         self.modifies.push(write);
     }
 
     pub(crate) fn delete_value(&mut self, key: Key, ts: TimeStamp) {
-        let write = Modify::Delete(CF_DEFAULT, key.append_ts(ts));
+        let write = Modify::Delete(CF_DEFAULT, key.append_ts(ts), None);
         self.write_size += write.size();
         self.modifies.push(write);
     }
 
     pub(crate) fn put_write(&mut self, key: Key, ts: TimeStamp, value: Value) {
-        let write = Modify::Put(CF_WRITE, key.append_ts(ts), value);
+        let write = Modify::Put(CF_WRITE, key, Some(ts), value);
         self.write_size += write.size();
         self.modifies.push(write);
     }
 
     pub(crate) fn delete_write(&mut self, key: Key, ts: TimeStamp) {
-        let write = Modify::Delete(CF_WRITE, key.append_ts(ts));
+        let write = Modify::Delete(CF_WRITE, key, Some(ts));
         self.write_size += write.size();
         self.modifies.push(write);
     }

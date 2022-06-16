@@ -29,6 +29,15 @@ impl Peekable for PanicSnapshot {
     ) -> Result<Option<Self::DbVector>> {
         panic!()
     }
+
+    fn get_value_ts_cf_opt(
+        &self,
+        opts: &ReadOptions,
+        cf: &str,
+        key: &[u8],
+    ) -> Result<Option<(Self::DbVector, Vec<u8>)>> {
+        panic!()
+    }
 }
 
 impl Iterable for PanicSnapshot {
@@ -65,6 +74,9 @@ impl Iterator for PanicSnapshotIterator {
     }
 
     fn key(&self) -> &[u8] {
+        panic!()
+    }
+    fn timestamp(&self) -> Option<&[u8]> {
         panic!()
     }
     fn value(&self) -> &[u8] {

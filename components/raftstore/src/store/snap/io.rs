@@ -13,7 +13,7 @@ use encryption::{
 };
 use engine_traits::{
     CfName, EncryptionKeyManager, Error as EngineError, Iterable, KvEngine, Mutable,
-    SstCompressionType, SstWriter, SstWriterBuilder, WriteBatch,
+    SstCompressionType, SstWriter, SstWriterBuilder, WriteBatch, CF_WRITE,
 };
 use kvproto::encryptionpb::EncryptionMethod;
 use tikv_util::{
@@ -132,48 +132,95 @@ where
         .to_string();
     let sst_writer = RefCell::new(create_sst_file_writer::<E>(engine, cf, &path)?);
     let mut file_length: usize = 0;
-    box_try!(snap.scan(cf, start_key, end_key, false, |key, value| {
-        let entry_len = key.len() + value.len();
-        if file_length + entry_len > raw_size_per_file as usize {
-            cf_file.add_file(file_id); // add previous file
-            file_length = 0;
-            file_id += 1;
-            let prev_path = path.clone();
-            path = cf_file
-                .path
-                .join(cf_file.gen_tmp_file_name(file_id))
-                .to_str()
-                .unwrap()
-                .to_string();
-            let result = create_sst_file_writer::<E>(engine, cf, &path);
-            match result {
-                Ok(new_sst_writer) => {
-                    let old_writer = sst_writer.replace(new_sst_writer);
-                    box_try!(old_writer.finish());
-                    box_try!(File::open(&prev_path).and_then(|f| f.sync_all()));
+    if cf == CF_WRITE {
+        box_try!(
+            snap.scan_cf_with_ts(cf, start_key, end_key, false, |key, ts, value| {
+                let entry_len = key.len() + ts.len() + value.len();
+                if file_length + entry_len > raw_size_per_file as usize {
+                    cf_file.add_file(file_id); // add previous file
+                    file_length = 0;
+                    file_id += 1;
+                    let prev_path = path.clone();
+                    path = cf_file
+                        .path
+                        .join(cf_file.gen_tmp_file_name(file_id))
+                        .to_str()
+                        .unwrap()
+                        .to_string();
+                    let result = create_sst_file_writer::<E>(engine, cf, &path);
+                    match result {
+                        Ok(new_sst_writer) => {
+                            let old_writer = sst_writer.replace(new_sst_writer);
+                            box_try!(old_writer.finish());
+                            box_try!(File::open(&prev_path).and_then(|f| f.sync_all()));
+                        }
+                        Err(e) => {
+                            let io_error = io::Error::new(io::ErrorKind::Other, e);
+                            return Err(io_error.into());
+                        }
+                    }
                 }
-                Err(e) => {
+                while entry_len > remained_quota {
+                    // It's possible to acquire more than necessary, but let it be.
+                    io_limiter.blocking_consume(IO_LIMITER_CHUNK_SIZE);
+                    remained_quota += IO_LIMITER_CHUNK_SIZE;
+                }
+                remained_quota -= entry_len;
+
+                stats.key_count += 1;
+                stats.total_size += entry_len;
+                if let Err(e) = sst_writer.borrow_mut().put_with_ts(key, ts, value) {
                     let io_error = io::Error::new(io::ErrorKind::Other, e);
                     return Err(io_error.into());
                 }
+                file_length += entry_len;
+                Ok(true)
+            })
+        );
+    } else {
+        box_try!(snap.scan(cf, start_key, end_key, false, |key, value| {
+            let entry_len = key.len() + value.len();
+            if file_length + entry_len > raw_size_per_file as usize {
+                cf_file.add_file(file_id); // add previous file
+                file_length = 0;
+                file_id += 1;
+                let prev_path = path.clone();
+                path = cf_file
+                    .path
+                    .join(cf_file.gen_tmp_file_name(file_id))
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                let result = create_sst_file_writer::<E>(engine, cf, &path);
+                match result {
+                    Ok(new_sst_writer) => {
+                        let old_writer = sst_writer.replace(new_sst_writer);
+                        box_try!(old_writer.finish());
+                        box_try!(File::open(&prev_path).and_then(|f| f.sync_all()));
+                    }
+                    Err(e) => {
+                        let io_error = io::Error::new(io::ErrorKind::Other, e);
+                        return Err(io_error.into());
+                    }
+                }
             }
-        }
-        while entry_len > remained_quota {
-            // It's possible to acquire more than necessary, but let it be.
-            io_limiter.blocking_consume(IO_LIMITER_CHUNK_SIZE);
-            remained_quota += IO_LIMITER_CHUNK_SIZE;
-        }
-        remained_quota -= entry_len;
+            while entry_len > remained_quota {
+                // It's possible to acquire more than necessary, but let it be.
+                io_limiter.blocking_consume(IO_LIMITER_CHUNK_SIZE);
+                remained_quota += IO_LIMITER_CHUNK_SIZE;
+            }
+            remained_quota -= entry_len;
 
-        stats.key_count += 1;
-        stats.total_size += entry_len;
-        if let Err(e) = sst_writer.borrow_mut().put(key, value) {
-            let io_error = io::Error::new(io::ErrorKind::Other, e);
-            return Err(io_error.into());
-        }
-        file_length += entry_len;
-        Ok(true)
-    }));
+            stats.key_count += 1;
+            stats.total_size += entry_len;
+            if let Err(e) = sst_writer.borrow_mut().put(key, value) {
+                let io_error = io::Error::new(io::ErrorKind::Other, e);
+                return Err(io_error.into());
+            }
+            file_length += entry_len;
+            Ok(true)
+        }));
+    }
     if stats.key_count > 0 {
         cf_file.add_file(file_id);
         box_try!(sst_writer.into_inner().finish());

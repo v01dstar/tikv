@@ -17,6 +17,9 @@ impl From<engine_traits::ReadOptions> for RocksReadOptions {
     fn from(opts: engine_traits::ReadOptions) -> Self {
         let mut r = RawReadOptions::default();
         r.set_fill_cache(opts.fill_cache());
+        if let Some(ts) = opts.get_timestamp() {
+            r.set_timestamp(ts.into_encoded());
+        }
         RocksReadOptions(r)
     }
 }
@@ -81,6 +84,14 @@ fn build_read_opts(iter_opts: engine_traits::IterOptions) -> RawReadOptions {
             iter_opts.hint_min_ts(),
             iter_opts.hint_max_ts(),
         ))
+    }
+
+    if let Some(ts) = iter_opts.timestamp() {
+        opts.set_timestamp(ts.into_encoded())
+    }
+
+    if let Some(ts) = iter_opts.iter_start_ts() {
+        opts.set_iter_start_ts(ts.into_encoded())
     }
 
     let (lower, upper) = iter_opts.build_bounds();
