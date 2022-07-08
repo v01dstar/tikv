@@ -346,7 +346,11 @@ impl<ER: RaftEngine> Debugger<ER> {
         Ok(errors)
     }
 
-    pub fn set_region_tombstone_by_id(&self, regions: Vec<u64>) -> Result<Vec<(u64, Error)>> {
+    pub fn set_region_tombstone_by_id(
+        &self,
+        regions: Vec<u64>,
+        undo: bool,
+    ) -> Result<Vec<(u64, Error)>> {
         let db = &self.engines.kv;
         let mut wb = db.write_batch();
         let mut errors = Vec::with_capacity(regions.len());
@@ -365,11 +369,15 @@ impl<ER: RaftEngine> Debugger<ER> {
                     continue;
                 }
             };
+            let region = &region_state.get_region();
             if region_state.get_state() == PeerState::Tombstone {
-                info!("skip {} because it's already tombstone", region_id);
+                if undo {
+                    write_peer_state(&mut wb, region, PeerState::Normal, None).unwrap();
+                } else {
+                    info!("skip {} because it's already tombstone", region_id);
+                }
                 continue;
             }
-            let region = &region_state.get_region();
             write_peer_state(&mut wb, region, PeerState::Tombstone, None).unwrap();
         }
 
@@ -1753,7 +1761,7 @@ mod tests {
         let engine = &debugger.engines.kv;
 
         // tombstone region 1 which currently not exists.
-        let errors = debugger.set_region_tombstone_by_id(vec![1]).unwrap();
+        let errors = debugger.set_region_tombstone_by_id(vec![1], false).unwrap();
         assert!(!errors.is_empty());
 
         // region 1 with peers at stores 11, 12, 13.
@@ -1762,13 +1770,18 @@ mod tests {
         expected_state.set_state(PeerState::Tombstone);
 
         // tombstone region 1.
-        let errors = debugger.set_region_tombstone_by_id(vec![1]).unwrap();
+        let errors = debugger.set_region_tombstone_by_id(vec![1], false).unwrap();
         assert!(errors.is_empty());
         assert_eq!(get_region_state(engine.as_inner(), 1), expected_state);
 
         // tombstone region 1 again.
-        let errors = debugger.set_region_tombstone_by_id(vec![1]).unwrap();
+        let errors = debugger.set_region_tombstone_by_id(vec![1], false).unwrap();
         assert!(errors.is_empty());
+        assert_eq!(get_region_state(engine.as_inner(), 1), expected_state);
+
+        let errors = debugger.set_region_tombstone_by_id(vec![1], true).unwrap();
+        assert!(errors.is_empty());
+        expected_state.set_state(PeerState::Normal);
         assert_eq!(get_region_state(engine.as_inner(), 1), expected_state);
     }
 
