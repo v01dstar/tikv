@@ -5,6 +5,7 @@ use std::{
     collections::{BinaryHeap, VecDeque},
     error::Error as StdError,
     fmt::{self, Display, Formatter},
+    simd::num,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
@@ -548,36 +549,42 @@ fn collect_ranges_need_compact(
     Ok(ranges_need_compact)
 }
 
+fn get_compact_score(
+    range_stats: &RangeStats,
+    compact_threshold: &CompactThreshold,
+    compaction_filter_enabled: bool,
+) -> f64 {
+    if range_stats.num_entries < range_stats.num_versions {
+        return 0.0;
+    }
+
+    let num_discardable = range_stats.num_entries - range_stats.num_versions;
+    if compaction_filter_enabled {
+        num_discardable += range_stats.redundant_keys();
+    }
+
+    num_discardable as f64 / range_stats.num_entries as f64
+}
+
 fn get_top_n_ranges_to_compact(
     engine: &impl KvEngine,
     ranges: Vec<Key>,
     compact_threshold: CompactThreshold,
     top_n: usize,
     compaction_filter_enabled: bool,
-) -> Result<BinaryHeap<MinHeapEntry>> {
+) -> Result<Vec<CompactionUnit>> {
     let mut heap = BinaryHeap::new();
     for range in ranges.iter().windows(2) {
-        // Get total entries and total versions in this range and checks if it needs to
-        // be compacted.
+        let mut score = 0.0;
+
         if let Some(range_stats) = engine.get_range_stats(CF_WRITE, &range[0], &range[1])? {
-            if !need_compact(&range_stats, &compact_threshold) {
-                continue;
-            }
+            score = get_compact_score(range_stats, compact_threshold, compaction_filter_enabled);
         } else {
             // Empty range, skip it.
             continue;
         }
 
-        // Calculate the score for the range.
-        let estimate_num_del = range_stats.num_entries - range_stats.num_versions;
-        let redundant_keys = range_stats.redundant_keys();
-        let score = if compaction_filter_enabled {
-            redundant_keys as f64 / range_stats.num_entries as f64
-        } else {
-            estimate_num_del as f64 / range_stats.num_entries as f64
-        };
-        if heap.len() >= top_n && score < heap.peek().map_or(1.0, |e| e.0.0) {
-            // If the score is less than the top of the heap, skip it.
+        if score < heap.top().0.0 {
             continue;
         }
 
@@ -597,9 +604,7 @@ fn get_top_n_ranges_to_compact(
             heap.pop();
         }
     }
-
-    // Return the top N ranges.
-    sorted_ranges.into_iter().take(top_n).collect()
+    heap
 }
 
 #[cfg(test)]
