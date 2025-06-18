@@ -6,6 +6,7 @@ use std::{
         BTreeMap,
         Bound::{Excluded, Included, Unbounded},
     },
+    intrinsics::AggregateRawPtr,
     path::Path,
     sync::Arc,
 };
@@ -17,7 +18,10 @@ use rocksdb::{
 };
 use tikv_util::warn;
 
-use crate::properties::{RangeProperties, UserCollectedPropertiesDecoder};
+use crate::{
+    mvcc_properties,
+    properties::{self, RangeProperties, UserCollectedPropertiesDecoder},
+};
 
 pub struct RocksCompactionJobInfo<'a>(&'a RawCompactionJobInfo);
 
@@ -122,6 +126,8 @@ impl RocksCompactedEvent {
         end_key: Vec<u8>,
         input_props: Vec<RangeProperties>,
         output_props: Vec<RangeProperties>,
+        aggregated_input_range_stats: Option<RangeStats>,
+        aggregated_output_range_stats: Option<RangeStats>,
     ) -> RocksCompactedEvent {
         RocksCompactedEvent {
             cf: info.cf_name().to_owned(),

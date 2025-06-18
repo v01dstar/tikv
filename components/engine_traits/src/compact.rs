@@ -4,7 +4,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::{CfNamesExt, errors::Result};
+use kvproto::import_sstpb::Range;
+
+use crate::{CfNamesExt, RangeStats, errors::Result};
 
 #[derive(Clone, Debug)]
 pub struct ManualCompactionOptions {

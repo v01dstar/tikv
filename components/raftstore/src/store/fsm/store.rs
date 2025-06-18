@@ -24,7 +24,8 @@ use concurrency_manager::ConcurrencyManager;
 use crossbeam::channel::{TryRecvError, TrySendError};
 use engine_traits::{
     CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE, CompactedEvent, DeleteStrategy, Engines, KvEngine,
-    Mutable, PerfContextKind, RaftEngine, RaftLogBatch, Range, WriteBatch, WriteOptions,
+    Mutable, PerfContextKind, RaftEngine, RaftLogBatch, Range, RangeStats, WriteBatch,
+    WriteOptions,
 };
 use fail::fail_point;
 use file_system::{IoType, WithIoType};
@@ -741,6 +742,7 @@ struct Store {
     start_time: Option<Timespec>,
     consistency_check_time: HashMap<u64, Instant>,
     store_reachability: HashMap<u64, StoreReachability>,
+    mvcc_stats: Option<RangeStats>,
 }
 
 struct StoreReachability {
@@ -770,6 +772,7 @@ where
                 start_time: None,
                 consistency_check_time: HashMap::default(),
                 store_reachability: HashMap::default(),
+                mvcc_stats: None,
             },
             receiver: rx,
         });
@@ -917,6 +920,14 @@ impl<EK: KvEngine + 'static, ER: RaftEngine + 'static, T: Transport>
                 StoreMsg::GcSnapshotFinish => self.register_snap_mgr_gc_tick(),
                 StoreMsg::AwakenRegions { abnormal_stores } => {
                     self.on_wake_up_regions(abnormal_stores);
+                }
+                StoreMsg::CollectWholeRangeMVCCStats { mvcc_stats } => {
+                    self.fsm.store.mvcc_stats = Some(mvcc_stats);
+                }
+                StoreMsg::UpdateMVCCStats { mvcc_delta } => {
+                    if let Some(ref mut stats) = self.fsm.store.mvcc_stats {
+                        stats.add(&mvcc_delta);
+                    }
                 }
             }
         }
@@ -2606,6 +2617,14 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'_, EK, ER, T>
                 })),
             );
         }
+        if let Some(ref mut mvcc_stats) = self.fsm.store.mvcc_stats {
+            if let Some(input_stats) = event.get_input_range_stats() {
+                mvcc_stats.sub(input_stats);
+            }
+            if let Some(output_stats) = event.get_output_range_stats() {
+                mvcc_stats.add(output_stats);
+            }
+        }
     }
 
     fn register_load_metrics_window_tick(&self) {
@@ -3567,6 +3586,8 @@ mod tests {
             end_key: prop.largest_key().unwrap(),
             input_props: vec![prop],
             output_props: vec![],
+            aggregated_input_range_stats: None,
+            aggregated_output_range_stats: None,
         };
 
         let mut region_ranges = BTreeMap::new();
