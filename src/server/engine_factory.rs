@@ -4,9 +4,9 @@ use std::{path::Path, sync::Arc};
 
 use encryption_export::DataKeyManager;
 use engine_rocks::{
-    CompactedEventSender, CompactionListener, FlowListener, RocksCfOptions, RocksCompactionJobInfo,
-    RocksDbOptions, RocksEngine, RocksEventListener, RocksPersistenceListener, RocksStatistics,
-    TabletLogger,
+    CompactedEventSender, CompactionListener, FlowListener, FlushEventSender, RocksCfOptions,
+    RocksCompactionJobInfo, RocksDbOptions, RocksEngine, RocksEventListener,
+    RocksPersistenceListener, RocksStatistics, TabletLogger,
     raw::{Cache, Env},
     util::RangeCompactionFilterFactory,
 };
@@ -39,6 +39,7 @@ struct FactoryInner {
 pub struct KvEngineFactoryBuilder {
     inner: FactoryInner,
     compact_event_sender: Option<Arc<dyn CompactedEventSender + Send + Sync>>,
+    flush_event_sender: Option<Arc<dyn FlushEventSender + Send + Sync>>,
 }
 
 impl KvEngineFactoryBuilder {
@@ -62,6 +63,7 @@ impl KvEngineFactoryBuilder {
                 lite: false,
             },
             compact_event_sender: None,
+            flush_event_sender: None,
         }
     }
 
@@ -88,6 +90,11 @@ impl KvEngineFactoryBuilder {
         self
     }
 
+    pub fn flush_event_sender(mut self, sender: Arc<dyn FlushEventSender + Send + Sync>) -> Self {
+        self.flush_event_sender = Some(sender);
+        self
+    }
+
     /// Set whether enable lite mode.
     ///
     /// In lite mode, most listener/filters will not be installed.
@@ -107,6 +114,7 @@ impl KvEngineFactoryBuilder {
         KvEngineFactory {
             inner: Arc::new(self.inner),
             compact_event_sender: self.compact_event_sender.clone(),
+            flush_event_sender: self.flush_event_sender.clone(),
         }
     }
 }
@@ -115,6 +123,7 @@ impl KvEngineFactoryBuilder {
 pub struct KvEngineFactory {
     inner: Arc<FactoryInner>,
     compact_event_sender: Option<Arc<dyn CompactedEventSender + Send + Sync>>,
+    flush_event_sender: Option<Arc<dyn FlushEventSender + Send + Sync>>,
 }
 
 impl KvEngineFactory {

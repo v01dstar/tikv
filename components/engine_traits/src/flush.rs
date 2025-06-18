@@ -171,6 +171,11 @@ pub trait StateStorage: Sync + Send {
     fn persist_progress(&self, region_id: u64, tablet_index: u64, pr: ApplyProgress);
 }
 
+pub trait FlushEvent: Send {
+    fn cf(&self) -> &str;
+    fn get_output_range_stats(&self) -> Option<&RangeStats>;
+}
+
 /// A flush listener that maps memtable to apply index and persist the relation
 /// to raft engine.
 pub struct PersistenceListener {

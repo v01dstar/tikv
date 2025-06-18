@@ -1,7 +1,8 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
-use engine_traits::PersistenceListener;
+use engine_traits::{CF_WRITE, FlushEvent, PersistenceListener, RangeStats};
 use file_system::{IoType, get_io_type, set_io_type};
+use kvproto::kvrpcpb::Op;
 use regex::Regex;
 use rocksdb::{
     CompactionJobInfo, DBBackgroundErrorReason, FlushJobInfo, IngestionInfo, MemTableInfo,
@@ -9,24 +10,37 @@ use rocksdb::{
 };
 use tikv_util::{error, metrics::CRITICAL_ERROR, set_panic_mark, warn, worker::Scheduler};
 
-use crate::rocks_metrics::*;
+use crate::{mvcc_properties, rocks_metrics::*, table_properties};
 
 // Message for RocksDB status subcode kNoSpace.
 const NO_SPACE_ERROR: &str = "IO error: No space left on device";
 
+pub struct RocksStatsChangeEvent {
+    pub cf_name: String,
+    pub aggr_input_range_stats: Option<RangeStats>,
+    pub aggr_output_range_stats: Option<RangeStats>,
+}
+
+pub trait RocksStatsChangeEventSender {
+    fn send(&self, event: RocksStatsChangeEvent);
+}
+
 pub struct RocksEventListener {
     db_name: String,
     sst_recovery_scheduler: Option<Scheduler<String>>,
+    stats_change_event_senders: Box<dyn RocksStatsChangeEventSender + Send + Sync>,
 }
 
 impl RocksEventListener {
     pub fn new(
         db_name: &str,
         sst_recovery_scheduler: Option<Scheduler<String>>,
+        stats_change_event_senders: Box<dyn RocksStatsChangeEventSender + Send + Sync>,
     ) -> RocksEventListener {
         RocksEventListener {
             db_name: db_name.to_owned(),
             sst_recovery_scheduler,
+            stats_change_event_senders,
         }
     }
 }
@@ -42,6 +56,31 @@ impl rocksdb::EventListener for RocksEventListener {
             .inc();
         if get_io_type() == IoType::Flush {
             set_io_type(IoType::Other);
+        }
+        if job.cf_name() == CF_WRITE {
+            let table_properties = job.table_properties();
+            match mvcc_properties::RocksMvccProperties::decode(
+                table_properties.user_collected_properties(),
+            ) {
+                Ok(mvcc_props) => {
+                    self.stats_change_event_senders.send(RocksStatsChangeEvent {
+                        cf_name: job.cf_name().to_string(),
+                        aggr_input_range_stats: None,
+                        aggr_output_range_stats: Some(RangeStats {
+                            num_entries: table_properties.num_entries(),
+                            num_versions: mvcc_props.num_versions,
+                            num_rows: mvcc_props.num_rows,
+                            num_deletes: mvcc_props.num_deletes,
+                        }),
+                    });
+                }
+                Err(_) => {
+                    slog_global::error!(
+                        "failed to decode MVCC properties";
+                        "path" => job.file_path().display()
+                    );
+                }
+            }
         }
     }
 
@@ -74,6 +113,50 @@ impl rocksdb::EventListener for RocksEventListener {
             || info.base_input_level() != 0 && get_io_type() == IoType::Compaction
         {
             set_io_type(IoType::Other);
+        }
+        if info.cf_name() == CF_WRITE {
+            let mut aggregated_input_num_entries = 0;
+            let mut aggregated_output_num_entries = 0;
+            let mut aggregated_input_mvcc_properties = MvccProperties::new();
+            let mut aggregated_output_mvcc_properties = MvccProperties::new();
+            for (file, properties) in iter {
+                match mvcc_properties::RocksMvccProperties::decode(
+                    properties.user_collected_properties(),
+                ) {
+                    Ok(mvcc_properties) => {
+                        if input_files.contains(file) {
+                            aggregated_input_num_entries += properties.num_entries();
+                            aggregated_input_mvcc_properties.add(&mvcc_properties);
+                        }
+                        if output_files.contains(file) {
+                            aggregated_output_num_entries += properties.num_entries();
+                            aggregated_output_mvcc_properties.add(&mvcc_properties);
+                        }
+                    }
+                    Err(_) => {
+                        warn!("Decode MVCC properties from sst file failed");
+                        return;
+                    }
+                };
+            }
+            let aggr_input_range_stats = Some(RangeStats {
+                num_entries: aggregated_input_num_entries,
+                num_versions: aggregated_input_mvcc_properties.num_versions,
+                num_rows: aggregated_input_mvcc_properties.num_rows,
+                num_deletes: aggregated_input_mvcc_properties.num_deletes,
+            });
+            let aggr_output_range_stats = Some(RangeStats {
+                num_entries: aggregated_output_num_entries,
+                num_versions: aggregated_output_mvcc_properties.num_versions,
+                num_rows: aggregated_output_mvcc_properties.num_rows,
+                num_deletes: aggregated_output_mvcc_properties.num_deletes,
+            });
+            self.stats_change_event_senders
+                .send(RocksTableStatsChangeEvent {
+                    cf_name: info.cf_name().to_string(),
+                    aggr_input_range_stats,
+                    aggr_output_range_stats,
+                });
         }
     }
 
@@ -180,6 +263,26 @@ fn resolve_sst_filename_from_err(err: &str) -> Option<String> {
     Some(filename)
 }
 
+pub struct RocksFlushEvent {
+    pub cf_name: String,
+    pub aggregated_output_range_stats: Option<RangeStats>,
+}
+
+impl FlushEvent for RocksFlushEvent {
+    fn cf(&self) -> &str {
+        &self.cf_name
+    }
+
+    fn get_output_range_stats(&self) -> Option<&RangeStats> {
+        self.aggregated_output_range_stats.as_ref()
+    }
+}
+
+// Following CompactEventSender
+pub trait FlushEventSender {
+    fn send(&self, event: RocksFlushEvent);
+}
+
 pub struct RocksPersistenceListener(PersistenceListener);
 
 impl RocksPersistenceListener {
@@ -192,7 +295,7 @@ impl rocksdb::EventListener for RocksPersistenceListener {
     fn on_memtable_sealed(&self, info: &MemTableInfo) {
         // Note: first_seqno is effectively the smallest seqno of memtable.
         // earliest_seqno has ambiguous semantics.
-        self.0.on_memtable_sealed(
+        self.persistence_listener.on_memtable_sealed(
             info.cf_name().to_string(),
             info.first_seqno(),
             info.largest_seqno(),
@@ -216,7 +319,7 @@ impl rocksdb::EventListener for RocksPersistenceListener {
                 0
             }
         };
-        self.0
+        self.persistence_listener
             .on_flush_completed(job.cf_name(), job.largest_seqno(), num);
     }
 }

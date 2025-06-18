@@ -3,6 +3,7 @@
 use std::{
     cmp,
     collections::HashMap,
+    f128::consts::PHI,
     io::Read,
     ops::{Deref, DerefMut},
 };
@@ -24,6 +25,7 @@ use txn_types::{Key, Write, WriteType};
 
 use crate::{
     decode_properties::{DecodeProperties, IndexHandle, IndexHandles},
+    engine,
     mvcc_properties::*,
 };
 
@@ -568,6 +570,35 @@ pub fn get_range_stats(
         num_rows: props.num_rows,
         num_deletes: props.num_deletes,
     })
+}
+
+pub fn get_all_table_stats(engine: &crate::RocksEngine, cf: &str) -> Result<Option<RangeStats>> {
+    let collection = match engine.get_properties_of_all_tables_cf(cf) {
+        Ok(v) => v,
+        Err(e) => {
+            info!("failed to get properties of all tables in cf"; "cf" => cf);
+            return Err(e);
+        }
+    };
+    if collection.is_empty() {
+        return Ok(None);
+    }
+    let mut props = MvccProperties::new();
+    let mut num_entries = 0;
+    for (_, v) in collection.iter() {
+        let mvcc = match RocksMvccProperties::decode(v.user_collected_properties()) {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
+        num_entries += v.num_entries();
+        props.add(&mvcc);
+    }
+    Ok(Some(RangeStats {
+        num_entries,
+        num_versions: props.num_versions,
+        num_rows: props.num_rows,
+        num_deletes: props.num_deletes,
+    }))
 }
 
 #[cfg(test)]

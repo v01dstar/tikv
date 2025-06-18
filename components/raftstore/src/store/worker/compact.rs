@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use engine_traits::{CF_WRITE, KvEngine, ManualCompactionOptions, RangeStats};
+use engine_traits::{CF_WRITE, KvEngine, ManualCompactionOptions, RangeStats, RaftEngine};
 use fail::fail_point;
 use futures_util::compat::Future01CompatExt;
 use thiserror::Error;
@@ -16,6 +16,8 @@ use tikv_util::{
     box_try, debug, error, info, time::Instant, timer::GLOBAL_TIMER_HANDLE, warn, worker::Runnable,
 };
 use yatp::Remote;
+
+use crate::store::RaftRouter;
 
 use super::metrics::{
     COMPACT_RANGE_CF, FULL_COMPACT, FULL_COMPACT_INCREMENTAL, FULL_COMPACT_PAUSE,
@@ -38,6 +40,8 @@ pub enum Task {
         end_key: Option<Key>,         // None means largest key
         bottommost_level_force: bool, // Whether force the bottommost level to compact
     },
+
+    CollectWholeRangeMVCCStats,
 
     CheckAndCompact {
         // Column families need to compact
@@ -170,6 +174,7 @@ impl Display for Task {
                 )
                 .field("bottommost_level_force", bottommost_level_force)
                 .finish(),
+            Task::CollectWholeRangeMVCCStats => f.debug_struct("CollectWholeRangeMVCCStats").finish(),
             Task::CheckAndCompact {
                 ref cf_names,
                 ref ranges,
@@ -211,17 +216,18 @@ pub enum Error {
     Other(#[from] Box<dyn StdError + Sync + Send>),
 }
 
-pub struct Runner<E> {
-    engine: E,
+pub struct Runner<EK, ER> {
+    engine: EK,
     remote: Remote<yatp::task::future::TaskCell>,
+    router: RaftRouter<EK, ER>,
 }
 
-impl<E> Runner<E>
+impl<EK, ER> Runner<EK, ER>
 where
-    E: KvEngine,
+    EK: KvEngine, ER: RaftEngine,
 {
-    pub fn new(engine: E, remote: Remote<yatp::task::future::TaskCell>) -> Runner<E> {
-        Runner { engine, remote }
+    pub fn new(engine: EK, remote: Remote<yatp::task::future::TaskCell>, router: RaftRouter<EK, ER>) -> Runner<EK, ER> {
+        Runner { engine, remote, router }
     }
 
     /// Periodic full compaction.
@@ -296,6 +302,10 @@ where
             "time_takes" => ?timer.saturating_elapsed(),
         );
         Ok(())
+    }
+
+    pub fn collect_global_mvcc_stats(&mut self) {
+        self.engine.
     }
 
     /// Sends a compact range command to RocksDB to compact the range of the cf.
@@ -376,6 +386,18 @@ where
                     bottommost_level_force,
                 ) {
                     error!("execute compact range failed"; "cf" => cf, "err" => %e);
+                }
+            }
+            Task::CollectWholeRangeMVCCStats => {
+                match self.engine.get_whole_range_stats(CF_WRITE) {
+                    Ok(mvcc_stats) => {
+                        if let Some(mvcc_stats) = mvcc_stats {
+                            self.router.send(StoreMsg::CollectWholeRangeMVCCStats { mvcc_stats });
+                        }
+                    }
+                    Err(e) => {
+                        error!("collect whole range MVCC stats failed"; "err" => %e);
+                    }
                 }
             }
             Task::CheckAndCompact {
