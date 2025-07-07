@@ -212,6 +212,13 @@ lazy_static! {
         "Bucketed histogram of full compaction pauses for the storage."
     )
     .unwrap();
+    pub static ref CHECK_THEN_COMPACT_DURATION: HistogramVec = register_histogram_vec!(
+        "tikv_storage_check_then_compact_duration_seconds",
+        "Bucketed histogram of duration in storage check and compact worker",
+        &["type", "cf"],
+        exponential_buckets(0.001, 2.0, 20).unwrap()
+    )
+    .unwrap();
     pub static ref PROCESS_STAT_CPU_USAGE: Gauge = register_gauge!(
         "tikv_storage_process_stat_cpu_usage",
         "CPU usage measured over a 30 second window",

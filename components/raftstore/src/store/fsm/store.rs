@@ -10,7 +10,7 @@ use std::{
     },
     mem,
     ops::{Deref, DerefMut},
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{Arc, Mutex, Weak, atomic::Ordering},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -24,7 +24,8 @@ use concurrency_manager::ConcurrencyManager;
 use crossbeam::channel::{TryRecvError, TrySendError};
 use engine_traits::{
     CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE, CompactedEvent, DeleteStrategy, Engines, KvEngine,
-    Mutable, PerfContextKind, RaftEngine, RaftLogBatch, Range, WriteBatch, WriteOptions,
+    Mutable, PerfContextKind, RaftEngine, RaftLogBatch, Range, RangeStats, StatsChangeEvent,
+    WriteBatch, WriteOptions,
 };
 use fail::fail_point;
 use file_system::{IoType, WithIoType};
@@ -741,6 +742,7 @@ struct Store {
     start_time: Option<Timespec>,
     consistency_check_time: HashMap<u64, Instant>,
     store_reachability: HashMap<u64, StoreReachability>,
+    mvcc_stats: Option<RangeStats>,
 }
 
 struct StoreReachability {
@@ -754,6 +756,7 @@ where
 {
     store: Store,
     receiver: Receiver<StoreMsg<EK>>,
+    check_and_compact_running_indicator: Option<Weak<()>>,
 }
 
 impl<EK> StoreFsm<EK>
@@ -770,8 +773,10 @@ where
                 start_time: None,
                 consistency_check_time: HashMap::default(),
                 store_reachability: HashMap::default(),
+                mvcc_stats: None,
             },
             receiver: rx,
+            check_and_compact_running_indicator: None,
         });
         (tx, fsm)
     }
@@ -918,6 +923,22 @@ impl<EK: KvEngine + 'static, ER: RaftEngine + 'static, T: Transport>
                 StoreMsg::AwakenRegions { abnormal_stores } => {
                     self.on_wake_up_regions(abnormal_stores);
                 }
+                StoreMsg::DoneCollectWholeRangeMVCCStats { mvcc_stats } => {
+                    self.fsm.store.mvcc_stats = Some(mvcc_stats);
+                    self.update_mvcc_stats_metrics();
+                }
+                StoreMsg::StatsChangeEvent(event) => {
+                    assert!(event.cf() == CF_WRITE);
+                    if let Some(mvcc_stats) = self.fsm.store.mvcc_stats.as_mut() {
+                        if let Some(input) = event.get_input_range_stats() {
+                            mvcc_stats.sub(input);
+                        }
+                        if let Some(output) = event.get_output_range_stats() {
+                            mvcc_stats.add(output);
+                        }
+                    }
+                    self.update_mvcc_stats_metrics();
+                }
             }
         }
         slow_log!(
@@ -953,6 +974,23 @@ impl<EK: KvEngine + 'static, ER: RaftEngine + 'static, T: Transport>
         self.register_compact_lock_cf_tick();
         self.register_snap_mgr_gc_tick();
         self.register_consistency_check_tick();
+    }
+
+    fn update_mvcc_stats_metrics(&self) {
+        if let Some(mvcc_stats) = &self.fsm.store.mvcc_stats {
+            STORE_MVCC_STATS_GAUGE_VEC
+                .with_label_values(&["total_rocksdb_entries"])
+                .set(mvcc_stats.num_entries as i64);
+            STORE_MVCC_STATS_GAUGE_VEC
+                .with_label_values(&["total_tikv_entries"])
+                .set(mvcc_stats.num_versions as i64);
+            STORE_MVCC_STATS_GAUGE_VEC
+                .with_label_values(&["total_tikv_rows"])
+                .set(mvcc_stats.num_rows as i64);
+            STORE_MVCC_STATS_GAUGE_VEC
+                .with_label_values(&["total_tikv_deleted_rows"])
+                .set(mvcc_stats.num_deletes as i64);
+        }
     }
 }
 
@@ -1809,6 +1847,20 @@ impl<EK: KvEngine, ER: RaftEngine> RaftBatchSystem<EK, ER> {
         let cleanup_scheduler: Scheduler<CleanupTask> = workers
             .cleanup_worker
             .start("cleanup-worker", cleanup_runner);
+        let router_for_cb = self.router.clone();
+        if let Err(e) = cleanup_scheduler.schedule(CleanupTask::Compact(
+            CompactTask::CollectWholeRangeMVCCStats {
+                callback: Box::new(move |mvcc_stats| {
+                    if let Err(e) = router_for_cb
+                        .send_control(StoreMsg::DoneCollectWholeRangeMVCCStats { mvcc_stats })
+                    {
+                        error!("failed to send compact range stats"; "err" => ?e);
+                    }
+                }),
+            },
+        )) {
+            error!("failed to schedule collect whole range MVCC stats"; "err" => ?e);
+        }
         let consistency_check_runner =
             ConsistencyCheckRunner::<EK, _>::new(self.router.clone(), coprocessor_host.clone());
         let consistency_check_scheduler = workers
@@ -2738,6 +2790,82 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'_, EK, ER, T>
 
     fn on_compact_check_tick(&mut self) {
         self.register_compact_check_tick();
+        if let Some(token) = &self.fsm.check_and_compact_running_indicator {
+            if token.upgrade().is_some() {
+                info!(
+                    "compact check is running, skip compact check";
+                    "store_id" => self.fsm.store.id,
+                );
+                return;
+            }
+        }
+        if self.ctx.cleanup_scheduler.is_busy() {
+            debug!(
+                "compact worker is busy, skip compact check";
+                "store_id" => self.fsm.store.id,
+            );
+            return;
+        }
+
+        let meta = self.ctx.store_meta.lock().unwrap();
+        if meta.region_ranges.is_empty() {
+            debug!(
+            "there is no range need to check";
+            "store_id" => self.fsm.store.id
+            );
+            return;
+        }
+        // Divide region ranges by group_size, add DATA_MIN_KEY as first and
+        // DATA_MAX_KEY as last.
+        // let group_size = std::cmp::max(1, self.ctx.cfg.check_then_compact_group_size
+        // as usize); let estimated_groups = (meta.region_ranges.len() +
+        // group_size - 1) / group_size; let mut all_ranges =
+        // Vec::with_capacity(estimated_groups + 1); all_ranges.
+        // push(keys::DATA_MIN_KEY.to_vec());
+
+        // for (i, key) in meta.region_ranges.keys().enumerate() {
+        //     if (i + 1) % group_size == 0 {
+        //         all_ranges.push(key.clone());
+        //     }
+        // }
+        // // If the last group has fewer members than group_size, just use
+        // DATA_MAX_KEY. if meta.region_ranges.len() % group_size != 0 {
+        //     all_ranges.push(keys::DATA_MAX_KEY.to_vec());
+        // }
+        let mut all_ranges = Vec::with_capacity(meta.region_ranges.len() + 2);
+        all_ranges.push(keys::DATA_MIN_KEY.to_vec());
+        all_ranges.extend(meta.region_ranges.keys().cloned());
+        all_ranges.push(keys::DATA_MAX_KEY.to_vec());
+        let cf_names = vec![CF_WRITE.to_owned(), CF_DEFAULT.to_owned()];
+        let finished = Arc::new(());
+        self.fsm.check_and_compact_running_indicator = Some(Arc::downgrade(&finished));
+        if let Err(e) = self.ctx.cleanup_scheduler.schedule(CleanupTask::Compact(
+            CompactTask::CheckThenCompactTopN {
+                cf_names,
+                ranges: all_ranges,
+                compact_threshold: CompactThreshold::new(
+                    self.ctx.cfg.region_compact_min_tombstones,
+                    self.ctx.cfg.region_compact_tombstones_percent,
+                    self.ctx.cfg.region_compact_min_redundant_rows,
+                    self.ctx.cfg.region_compact_redundant_rows_percent(),
+                ),
+                compaction_filter_enabled: self.ctx.cfg.compaction_filter_enabled,
+                bottommost_level_force: self.ctx.cfg.check_then_compact_force_bottommost_level,
+                top_n: self.ctx.cfg.check_then_compact_top_n as usize,
+                finished,
+            },
+        )) {
+            error!(
+                "schedule space check task failed";
+                "store_id" => self.fsm.store.id,
+                "err" => ?e,
+            );
+        }
+    }
+
+    #[allow(dead_code)]
+    fn on_check_and_compact_tick(&mut self) {
+        self.register_compact_check_tick();
         if self.ctx.cleanup_scheduler.is_busy() {
             debug!(
                 "compact worker is busy, check space redundancy next time";
@@ -2817,6 +2945,7 @@ impl<EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'_, EK, ER, T>
                     self.ctx.cfg.region_compact_min_redundant_rows,
                     self.ctx.cfg.region_compact_redundant_rows_percent(),
                 ),
+                force_bottommost_level: self.ctx.cfg.check_then_compact_force_bottommost_level,
             },
         )) {
             error!(
